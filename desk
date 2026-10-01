@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Run a shell command through Desk Runner, so it has Screen Recording and
+Accessibility permission.
+
+  desk 'screencapture -x shot.png'
+  desk < script.sh
+  desk --permissions
+"""
+import json
+import os
+import socket
+import sys
+
+SOCKET = os.path.expanduser("~/Library/Application Support/Desk Runner/runner.sock")
+MARKER = b"\x00DESK_RC="
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--permissions"]:
+        command = "__permissions"
+    elif len(sys.argv) > 1:
+        command = " ".join(sys.argv[1:])
+    else:
+        command = sys.stdin.read()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect(SOCKET)
+    except OSError as error:
+        print(f"Desk Runner isn't running ({error}). Start it with: open -a 'Desk Runner'", file=sys.stderr)
+        return 127
+    client.sendall((json.dumps({"cmd": command, "cwd": os.getcwd()}) + "\n").encode())
+    held = b""
+    while True:
+        chunk = client.recv(65536)
+        if not chunk:
+            break
+        held += chunk
+        # Keep back enough to spot the exit-code marker if it's split.
+        cut = held.rfind(MARKER)
+        safe = cut if cut >= 0 else max(0, len(held) - len(MARKER) - 8)
+        sys.stdout.buffer.write(held[:safe])
+        sys.stdout.buffer.flush()
+        held = held[safe:]
+    if held.startswith(MARKER):
+        return int(held[len(MARKER):].strip() or 1)
+    sys.stdout.buffer.write(held)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
