@@ -40,3 +40,19 @@ From another machine: `ssh host '~/.local/bin/desk "deskctl windows"'`.
 Key presses clear the event's process ID so apps treat them like real typing.
 Some apps (pynput hotkeys, for one) still ignore them, because macOS fills the
 ID back in.
+
+Combos press each modifier down, then the key, then let the modifiers go, the
+way a person would, so apps that read the text of a key event (event taps,
+hotkey recorders) see "S" rather than "s", and no Shift is left held for the
+next click or drag. `deskctl hold shift 2` holds just a modifier.
+
+Small targets need exact coordinates. QuickTime's and AVKit's trim handles are
+about 10 points wide, and `drag` moves them fine when it starts in the middle of
+one. A downscaled screenshot is easy to misread by a few points, so crop the
+spot at full size first: `desk 'screencapture -x -R 80,910,120,80 crop.png'`.
+
+## Test
+
+`test/keys.sh` types into a scratch TextEdit document and checks what an event
+tap sees. It takes over the keyboard and mouse for a few seconds, so run it on
+the desk machine: `ssh tinker-desk 'bash ~/desk-runner/test/keys.sh'`.

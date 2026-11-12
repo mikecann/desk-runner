@@ -7,7 +7,7 @@
 //   deskctl drag X1 Y1 X2 Y2 [seconds]
 //   deskctl type "text" [perKeySeconds]
 //   deskctl key cmd+shift+4           press a combo (also: down, up, return, f11...)
-//   deskctl hold KEY seconds          hold a key down
+//   deskctl hold KEY seconds          hold a key or combo down (or just a modifier: shift)
 //   deskctl scroll DY [steps]
 //   deskctl button N                  press an extra mouse button (3 = back, 4 = forward)
 //   deskctl windows [app]             on-screen windows: id, app, title, x y w h
@@ -57,28 +57,65 @@ func asIfTyped(_ event: CGEvent?) {
     event?.setIntegerValueField(.eventSourceUnixProcessID, value: 0)
 }
 
+// Modifier keys and the flag each one sets.
+let modifiers: [String: (code: CGKeyCode, flag: CGEventFlags)] = [
+    "cmd": (55, .maskCommand), "command": (55, .maskCommand),
+    "shift": (56, .maskShift),
+    "alt": (58, .maskAlternate), "option": (58, .maskAlternate), "opt": (58, .maskAlternate),
+    "ctrl": (59, .maskControl), "control": (59, .maskControl),
+]
+
+func postKey(_ code: CGKeyCode, down: Bool, flags: CGEventFlags) {
+    // For a modifier's key code this makes a flagsChanged event.
+    let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
+    event?.flags = flags
+    asIfTyped(event)
+    event?.post(tap: .cghidEventTap)
+}
+
+// Modifiers that are down right now, so a Ctrl-C or kill during `hold` can let
+// them go instead of leaving the desk with Shift stuck down.
+var modifiersDown: [CGKeyCode] = []
+for sig in [SIGINT, SIGTERM, SIGHUP] {
+    signal(sig) { sig in
+        for code in modifiersDown.reversed() { postKey(code, down: false, flags: []) }
+        exit(128 + sig)
+    }
+}
+
+// Press the modifiers down one at a time, then the key, then let go in reverse,
+// like a person would. Setting the flags on the key event alone isn't enough:
+// macOS works out the event's text (what keyboardGetUnicodeString returns) from
+// the keyboard's modifier state, so "S" came out as "s" and the next key got the
+// Shift instead, and the modifiers could still be down for the next mouse event.
 func key(_ combo: String, hold: Double = 0) {
-    var flags: CGEventFlags = []
+    var held: [(code: CGKeyCode, flag: CGEventFlags)] = []
     var name = ""
     for part in combo.lowercased().split(separator: "+").map(String.init) {
-        switch part {
-        case "cmd", "command": flags.insert(.maskCommand)
-        case "shift": flags.insert(.maskShift)
-        case "alt", "option", "opt": flags.insert(.maskAlternate)
-        case "ctrl", "control": flags.insert(.maskControl)
-        default: name = part
-        }
+        if let modifier = modifiers[part] { held.append(modifier) } else { name = part }
     }
-    guard let code = keyCodes[name] else { fatalError("unknown key: \(name)") }
-    let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true)
-    down?.flags = flags
-    asIfTyped(down)
-    down?.post(tap: .cghidEventTap)
-    usleep(useconds_t(max(hold, 0.03) * 1_000_000))
-    let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
-    up?.flags = flags
-    asIfTyped(up)
-    up?.post(tap: .cghidEventTap)
+    // With no key besides modifiers ("hold shift 2"), just the modifiers are held.
+    let code = keyCodes[name]
+    if code == nil, !name.isEmpty || held.isEmpty { fatalError("unknown key: \(combo)") }
+
+    var flags: CGEventFlags = []
+    for modifier in held {
+        flags.insert(modifier.flag)
+        modifiersDown.append(modifier.code)
+        postKey(modifier.code, down: true, flags: flags)
+        usleep(10_000)
+    }
+    if let code { postKey(code, down: true, flags: flags) }
+    // Not usleep: a long hold overflows its 32-bit microseconds and traps with
+    // the modifiers still down.
+    Thread.sleep(forTimeInterval: max(hold, 0.03))
+    if let code { postKey(code, down: false, flags: flags) }
+    for modifier in held.reversed() {
+        usleep(10_000)
+        flags.remove(modifier.flag)
+        postKey(modifier.code, down: false, flags: flags)
+        modifiersDown.removeLast()
+    }
     usleep(30_000)
 }
 
