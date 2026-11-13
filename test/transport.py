@@ -147,7 +147,7 @@ class TransportTests(ClientHarness):
         self.assertEqual(result.returncode, 125)
         self.assertEqual(result.stderr, b"")
 
-    def test_bisect_aborts_on_lost_transport(self):
+    def bisect_repo(self):
         repo = self.home / "bisect-repo"
         repo.mkdir()
         def git(*args):
@@ -157,14 +157,30 @@ class TransportTests(ClientHarness):
             git("-c", "user.name=Transport Test", "-c", "user.email=test@example.invalid",
                 "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", str(n))
         git("bisect", "start", "HEAD", "HEAD~2")
-        def bisect_client():
-            return subprocess.run(["git", "bisect", "run", sys.executable, str(ROOT / "desk"), "ignored"],
-                                  cwd=repo, env=self.env, capture_output=True, timeout=15)
-        with mock.patch.object(self, "client", side_effect=lambda: bisect_client()):
-            result = self.response([])
+        return repo
+
+    def bisect_run(self, repo):
+        return subprocess.run(["git", "bisect", "run", sys.executable, str(ROOT / "desk"), "ignored"],
+                              cwd=repo, env=self.env, capture_output=True, timeout=15)
+
+    def assert_bisect_aborted(self, result):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"255", result.stderr)
         self.assertNotIn(b"skip", result.stderr)
+
+    def test_bisect_aborts_on_lost_transport(self):
+        repo = self.bisect_repo()
+        with mock.patch.object(self, "client", side_effect=lambda: self.bisect_run(repo)):
+            result = self.response([])
+        self.assert_bisect_aborted(result)
+
+    def test_bisect_aborts_when_service_is_unavailable(self):
+        self.assert_bisect_aborted(self.bisect_run(self.bisect_repo()))
+
+    def test_command_not_found_status_is_preserved(self):
+        result = self.response([MARKER + b"127\n"])
+        self.assertEqual(result.returncode, 127)
+        self.assertEqual(result.stderr, b"")
 
     def test_zero_exit(self):
         result = self.response([MARKER + b"0\n"])
@@ -173,7 +189,7 @@ class TransportTests(ClientHarness):
 
     def test_unavailable_service(self):
         result = self.client()
-        self.assertEqual(result.returncode, 127)
+        self.assertEqual(result.returncode, 255)
         self.assertIn(b"isn't running", result.stderr)
 
 

@@ -49,3 +49,157 @@ def idle_socket(path: Path, is_idle, timeout=10):
             parked.unlink(missing_ok=True)
         else:
             parked.rename(path)
+
+
+def service_pid(label):
+    import re
+    import subprocess
+    result = subprocess.run(["launchctl", "print", label], capture_output=True, text=True)
+    if result.returncode:
+        if "could not find service" in result.stderr.lower():
+            return None
+        raise BusyError(f"Cannot inspect Desk Runner: {result.stderr.strip()}")
+    match = re.search(r"\bpid = (\d+)", result.stdout)
+    if not match:
+        raise BusyError("Desk Runner is loaded but not yet running; wait for it to settle")
+    return int(match[1])
+
+
+def service_is_idle(label, pid):
+    import subprocess
+    if service_pid(label) != pid:
+        return False
+    table = subprocess.check_output(["ps", "-axo", "pid=,ppid="], text=True)
+    if any(int(line.split()[1]) == pid for line in table.splitlines()):
+        return False
+    result = subprocess.run(["lsof", "-n", "-a", "-p", str(pid), "-U", "-F", "f"],
+                            capture_output=True, text=True)
+    # Only the listener remains. Don't assume it has a particular FD number.
+    return result.returncode == 0 and sum(line.startswith("f") for line in result.stdout.splitlines()) == 1
+
+
+def install_prepared(root, stage, home=None):
+    """Install a signed staged app only after the live service is demonstrably idle."""
+    from contextlib import nullcontext
+    import hashlib
+    import os
+    import plistlib
+    import shutil
+    import subprocess
+    import time
+    import uuid
+
+    home = home or Path.home()
+    app = home / "Applications/Desk Runner.app"
+    support = home / "Library/Application Support/Desk Runner"
+    sock = support / "runner.sock"
+    label = f"gui/{os.getuid()}/com.mikecann.desk-runner"
+    agent = home / "Library/LaunchAgents/com.mikecann.desk-runner.plist"
+    staged_app = stage / "Desk Runner.app"
+    digest = hashlib.sha256((root / "Sources/main.swift").read_bytes()).hexdigest()[:16]
+    if (stage / "source-hash").read_text().strip() != digest:
+        raise BusyError("Prepared Desk Runner does not match its source")
+    if not (stage / "deskctl").is_file():
+        raise BusyError("Prepared deskctl is missing")
+    subprocess.run(["codesign", "--verify", str(staged_app)], check=True)
+    pid = service_pid(label)
+    if pid is None and sock.exists():
+        raise BusyError("Desk socket exists without an inspectable service; refusing to replace it")
+    guard = idle_socket(sock, lambda: service_is_idle(label, pid)) if pid else nullcontext()
+
+    # Prepare a sibling directory for atomic renames, never overwrite a live
+    # executable in place. A refused update doesn't change the installed files.
+    app.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex[:10]
+    ready = app.with_name(f".DeskRunner-new-{token}.app")
+    previous = app.with_name(f".DeskRunner-old-{token}.app")
+    shutil.copytree(staged_app, ready)
+    hash_file = support / "source-hash"
+    old_hash = hash_file.read_bytes() if hash_file.exists() else None
+    old_agent = agent.read_bytes() if agent.exists() else None
+    old_helper = root / "build/deskctl"
+    helper_backup = stage / "deskctl.previous"
+    if old_helper.exists():
+        shutil.copy2(old_helper, helper_backup)
+    stopped = False
+    replaced = False
+    installed = False
+    try:
+        with guard:
+            if pid:
+                subprocess.run(["launchctl", "bootout", label], check=True)
+            else:
+                subprocess.run(["launchctl", "bootout", label], capture_output=True)
+            stopped = True
+            if app.exists():
+                app.rename(previous)
+            ready.rename(app)
+            replaced = True
+            support.mkdir(parents=True, exist_ok=True)
+            agent.parent.mkdir(parents=True, exist_ok=True)
+            agent.write_bytes(plistlib.dumps({
+                "Label": "com.mikecann.desk-runner",
+                "ProgramArguments": [str(app / "Contents/MacOS/desk-runner")],
+                "RunAtLoad": True,
+                "KeepAlive": True,
+                "ProcessType": "Interactive",
+            }))
+            old_helper.parent.mkdir(parents=True, exist_ok=True)
+            helper_ready = old_helper.with_name(f"deskctl-{token}")
+            shutil.copy2(stage / "deskctl", helper_ready)
+            os.replace(helper_ready, old_helper)
+            hash_file.write_text(digest + "\n")
+            subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(agent)], check=True)
+            for _ in range(100):
+                if sock.exists():
+                    break
+                time.sleep(0.1)
+            else:
+                raise BusyError("Updated Desk Runner did not create its socket")
+            installed = True
+            stopped = False
+    finally:
+        if stopped:
+            subprocess.run(["launchctl", "bootout", label], capture_output=True)
+            if replaced:
+                shutil.rmtree(app)
+            if previous.exists():
+                previous.rename(app)
+            if old_hash is not None:
+                hash_file.write_bytes(old_hash)
+            else:
+                hash_file.unlink(missing_ok=True)
+            if old_agent is not None:
+                agent.write_bytes(old_agent)
+            else:
+                agent.unlink(missing_ok=True)
+            if helper_backup.exists():
+                os.replace(helper_backup, old_helper)
+            else:
+                old_helper.unlink(missing_ok=True)
+            if pid:
+                subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(agent)], check=True)
+        if ready.exists():
+            shutil.rmtree(ready)
+        if installed and previous.exists():
+            shutil.rmtree(previous)
+    bins = home / ".local/bin"
+    bins.mkdir(parents=True, exist_ok=True)
+    for name, target in [("desk", root / "desk"), ("deskctl", old_helper)]:
+        link = bins / name
+        link.unlink(missing_ok=True)
+        link.symlink_to(target)
+    print("Desk Runner installed after the idle queue barrier")
+
+
+if __name__ == "__main__":
+    import argparse
+    import subprocess
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("stage", type=Path)
+    parser.add_argument("root", type=Path)
+    args = parser.parse_args()
+    try:
+        install_prepared(args.root.resolve(), args.stage.resolve())
+    except (BusyError, OSError, subprocess.SubprocessError) as error:
+        parser.exit(1, f"{error}\n")

@@ -43,7 +43,7 @@ def main(request_id: str) -> int:
         client.connect(SOCKET)
     except OSError as error:
         report(f"Desk Runner isn't running ({error}). Start it with: open -a 'Desk Runner'")
-        return 127
+        return TRANSPORT_ERROR
     held = b""
     failure = "connection closed before an exit status arrived"
     with client:

@@ -19,7 +19,8 @@ bash install.sh
 That builds it into `~/Applications/Desk Runner.app`, starts it at login, and
 links `desk` and `deskctl` into `~/.local/bin`. Then turn Desk Runner on in
 System Settings > Privacy & Security, under both Screen Recording and
-Accessibility. `desk --permissions` tells you whether it worked. It only
+Accessibility. `desk --permissions` tells you whether it worked. It refuses to restart a busy service, including queued requests that have not
+yet been accepted. It only
 rebuilds the app when `Sources/main.swift` changes, because macOS asks you to
 approve every new build.
 
@@ -38,8 +39,8 @@ desk 'deskctl windows'                    # on-screen windows with their bounds
 From another machine: `ssh host '~/.local/bin/desk "deskctl windows"'`.
 
 `desk` returns the command's exit status, or `128 + signal` if it was killed
-by a signal. If the connection ends before an exit status arrives, it prints
-a diagnostic with a request ID and returns 255. That makes `git bisect run`
+by a signal. If the service cannot be reached or the connection ends before
+an exit status arrives, it prints a diagnostic with a request ID and returns 255. That makes `git bisect run`
 abort on a transport failure. A command's own status, including 125 (skip), is
 preserved. Commands can also return 255 themselves; the diagnostic identifies
 transport failures.
