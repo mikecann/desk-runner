@@ -39,7 +39,10 @@ From another machine: `ssh host '~/.local/bin/desk "deskctl windows"'`.
 
 `desk` returns the command's exit status, or `128 + signal` if it was killed
 by a signal. If the connection ends before an exit status arrives, it prints
-a diagnostic with a request ID and returns 125.
+a diagnostic with a request ID and returns 255. That makes `git bisect run`
+abort on a transport failure. A command's own status, including 125 (skip), is
+preserved. Commands can also return 255 themselves; the diagnostic identifies
+transport failures.
 
 A command never outlives whoever is watching it, so a script can't go on
 clicking and typing after nobody can see its result. If `desk` goes away
@@ -57,7 +60,7 @@ is discarded.
 If a reader that's still connected stops accepting output for 30 seconds, the
 service keeps the command running and discards further output. If the reader
 resumes, it reports the lost output and the command's actual status, and
-returns 125.
+returns 255.
 
 The service logs request IDs, child process IDs and completion statuses without
 logging command text. To inspect them on the machine running Desk Runner:
@@ -91,6 +94,11 @@ mkdir -p build
 taskpolicy -b swiftc -D DESK_RUNNER_TESTING Sources/main.swift -o build/test-server
 DESK_RUNNER_TEST_BINARY="$PWD/build/test-server" taskpolicy -b python3 test/transport.py
 ```
+
+`taskpolicy -b python3 test/update.py` checks the idle-update barrier against
+real temporary Unix sockets, including a connected request still waiting in
+the accept queue. Deployments use `idle_update.py` to block new connections and
+wait for that queue to drain before checking for active requests.
 
 `test/keys.sh` types into a scratch TextEdit document and checks what an event
 tap sees. It takes over the keyboard and mouse for a few seconds, so run it on

@@ -30,6 +30,7 @@ let supportDir = FileManager.default.homeDirectoryForCurrentUser
 #endif
 let socketPath = supportDir.appendingPathComponent("runner.sock").path
 let rcMarker = "\u{0}DESK_RC="
+let transportError: Int32 = 255
 #if DESK_RUNNER_TESTING
 let sendTimeoutSeconds = 3
 #else
@@ -73,7 +74,7 @@ final class Connection {
                 timedOut = false
                 let result = status.map { " Command exit status: \($0)." } ?? ""
                 let notice = "\nDesk Runner: \(discarded) bytes of output were not delivered because the reader stopped accepting output.\(result) (request \(id)).\n"
-                writeAll(Data("\(notice)\(rcMarker)125\n".utf8))
+                writeAll(Data("\(notice)\(rcMarker)\(transportError)\n".utf8))
             } else {
                 writeAll(data)
             }
@@ -86,32 +87,34 @@ final class Connection {
         data.withUnsafeBytes { raw in
             guard var p = raw.baseAddress else { return }
             var left = raw.count
-            let deadline = ProcessInfo.processInfo.systemUptime + Double(sendTimeoutSeconds)
+            var deadline = ProcessInfo.processInfo.systemUptime + Double(sendTimeoutSeconds)
             while left > 0 {
-                // A timed-out write may return a partial count. Don't give its
-                // remaining bytes another full timeout if the reader is stuck.
-                if ProcessInfo.processInfo.systemUptime >= deadline {
-                    timedOut = true
-                    discarded += left
-                    note("request=%@ output timed out; command is not cancelled", id)
-                    return
+                // Nonblocking sends expose actual progress, so a steady slow
+                // reader gets a fresh inactivity deadline after every write.
+                let n = Darwin.send(fd, p, left, MSG_DONTWAIT)
+                if n > 0 {
+                    p += n
+                    left -= n
+                    deadline = ProcessInfo.processInfo.systemUptime + Double(sendTimeoutSeconds)
+                    continue
                 }
-                let n = write(fd, p, left)
                 if n < 0 && errno == EINTR { continue }
-                if n <= 0 {
-                    let code = n < 0 ? errno : EIO
-                    discarded += left
-                    if code == EAGAIN || code == EWOULDBLOCK {
-                        timedOut = true
-                        note("request=%@ output timed out; command is not cancelled", id)
-                    } else {
-                        disconnected = true
-                        note("request=%@ client disconnected while sending (errno=%d)", id, code)
+                let code = n < 0 ? errno : EIO
+                if code == EAGAIN || code == EWOULDBLOCK {
+                    let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                    if remaining > 0 {
+                        var event = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                        _ = poll(&event, 1, Int32(min(remaining * 1000, 1000)))
+                        continue
                     }
-                    return
+                    timedOut = true
+                    note("request=%@ output timed out; command is not cancelled", id)
+                } else {
+                    disconnected = true
+                    note("request=%@ client disconnected while sending (errno=%d)", id, code)
                 }
-                p += n
-                left -= n
+                discarded += left
+                return
             }
         }
     }
@@ -264,16 +267,15 @@ func handle(_ fd: Int32) {
         close(fd)
         return
     }
-    // A connected caller that stops reading must not leave its command blocked
-    // behind a full output pipe forever. On timeout we discard further output
-    // but continue draining and waiting for that command.
-    var timeout = timeval(tv_sec: sendTimeoutSeconds, tv_usec: 0)
-    guard setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0 else {
-        note("could not set SO_SNDTIMEO: errno=%d", errno)
+    let request = readRequest(fd)
+    // Darwin's AF_UNIX send can still block with MSG_DONTWAIT alone. Set the
+    // descriptor nonblocking after consuming the request, before any response.
+    let socketFlags = fcntl(fd, F_GETFL)
+    guard socketFlags >= 0, fcntl(fd, F_SETFL, socketFlags | O_NONBLOCK) == 0 else {
+        note("could not make client socket nonblocking: errno=%d", errno)
         close(fd)
         return
     }
-    let request = readRequest(fd)
     let suppliedID = request?["id"] as? String ?? ""
     let id = !suppliedID.isEmpty && suppliedID.utf8.count <= 64 && suppliedID.utf8.allSatisfy({
         (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45
@@ -433,7 +435,7 @@ func handle(_ fd: Int32) {
         return
     }
     if outputFailed {
-        connection.finish(Data("Desk Runner: command output was lost (request \(id)); result unknown.\n\(rcMarker)125\n".utf8))
+        connection.finish(Data("Desk Runner: command output was lost (request \(id)); result unknown.\n\(rcMarker)\(transportError)\n".utf8))
         return
     }
     // Swift can't import WIFSIGNALED and friends.

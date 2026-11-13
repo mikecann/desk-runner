@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """No GUI actions. Optionally pass a -D DESK_RUNNER_TESTING server binary."""
+import io
 import json
 import os
+import runpy
 from pathlib import Path
 import socket
 import signal
@@ -11,6 +13,8 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = os.environ.get("DESK_RUNNER_TEST_BINARY")
@@ -44,7 +48,7 @@ class ClientHarness(unittest.TestCase):
             try:
                 with listener, listener.accept()[0] as conn:
                     if not read_request:
-                        # Closing with the client's request unread resets the socket.
+                        # Closing before reading the request may yield EOF on a Unix socket.
                         time.sleep(0.03)
                         return
                     request = b""
@@ -76,7 +80,7 @@ class TransportTests(ClientHarness):
 
     def test_missing_marker_preserves_tail_and_reports_unknown(self):
         result = self.response([b"compiling\nlast bytes"])
-        self.assertEqual(result.returncode, 125)
+        self.assertEqual(result.returncode, 255)
         self.assertEqual(result.stdout, b"compiling\nlast bytes")
         self.assertIn(b"result is unknown", result.stderr)
         self.assertIn(self.request["id"].encode(), result.stderr)
@@ -84,23 +88,82 @@ class TransportTests(ClientHarness):
 
     def test_empty_disconnect(self):
         result = self.response([])
-        self.assertEqual(result.returncode, 125)
+        self.assertEqual(result.returncode, 255)
         self.assertIn(b"connection closed", result.stderr)
 
     def test_invalid_status(self):
         for status in [b"oops", b"", b"256", b"-1", b"0trailing"]:
             with self.subTest(status=status):
                 result = self.response([b"output", MARKER + status + b"\n"])
-                self.assertEqual(result.returncode, 125)
+                self.assertEqual(result.returncode, 255)
                 self.assertEqual(result.stdout, b"output" + MARKER + status + b"\n")
                 self.assertIn(b"invalid or incomplete", result.stderr)
                 os.unlink(self.path)
 
     def test_close_before_reading_request_is_explained(self):
         result = self.response([], read_request=False)
-        self.assertEqual(result.returncode, 125)
-        self.assertIn(b"connection", result.stderr)
+        self.assertEqual(result.returncode, 255)
+        self.assertIn(b"connection closed before an exit status arrived", result.stderr)
         self.assertNotIn(b"Traceback", result.stderr)
+
+    def run_socket_error(self, operation):
+        entry = runpy.run_path(str(ROOT / "desk"))["main"]
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        if operation == "send":
+            connection.sendall.side_effect = BrokenPipeError("injected send failure")
+        else:
+            connection.recv.side_effect = [b"partial output\n", ConnectionResetError("injected receive failure")]
+        output = io.BytesIO()
+        error = io.StringIO()
+        poller = mock.MagicMock()
+        poller.poll.return_value = [(42, 1)]
+        with mock.patch.object(entry.__globals__["socket"], "socket", return_value=connection), \
+             mock.patch.object(entry.__globals__["select"], "poll", return_value=poller), \
+             mock.patch.object(sys, "argv", ["desk", "ignored"]), \
+             mock.patch.object(sys, "stdout", SimpleNamespace(buffer=output)), \
+             mock.patch.object(sys, "stderr", error):
+            status = entry("socket-error-request")
+        self.assertEqual(status, 255)
+        self.assertIn("connection failed", error.getvalue())
+        self.assertIn("socket-error-request", error.getvalue())
+        self.assertNotIn("Traceback", error.getvalue())
+        return connection, output.getvalue(), error.getvalue()
+
+    def test_send_oserror_is_explained(self):
+        connection, output, error = self.run_socket_error("send")
+        connection.recv.assert_not_called()
+        self.assertEqual(output, b"")
+        self.assertIn("injected send failure", error)
+
+    def test_receive_oserror_preserves_output_and_is_explained(self):
+        _, output, error = self.run_socket_error("recv")
+        self.assertEqual(output, b"partial output\n")
+        self.assertIn("injected receive failure", error)
+
+    def test_command_skip_status_is_preserved(self):
+        result = self.response([MARKER + b"125\n"])
+        self.assertEqual(result.returncode, 125)
+        self.assertEqual(result.stderr, b"")
+
+    def test_bisect_aborts_on_lost_transport(self):
+        repo = self.home / "bisect-repo"
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=repo, env=self.env, capture_output=True, check=True)
+        git("init", "-q")
+        for n in range(3):
+            git("-c", "user.name=Transport Test", "-c", "user.email=test@example.invalid",
+                "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", str(n))
+        git("bisect", "start", "HEAD", "HEAD~2")
+        def bisect_client():
+            return subprocess.run(["git", "bisect", "run", sys.executable, str(ROOT / "desk"), "ignored"],
+                                  cwd=repo, env=self.env, capture_output=True, timeout=15)
+        with mock.patch.object(self, "client", side_effect=lambda: bisect_client()):
+            result = self.response([])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"255", result.stderr)
+        self.assertNotIn(b"skip", result.stderr)
 
     def test_zero_exit(self):
         result = self.response([MARKER + b"0\n"])
@@ -204,7 +267,7 @@ class ServerTests(ClientHarness):
         self.server.kill()
         self.server.wait(timeout=5)
         _, error = client.communicate(timeout=5)
-        self.assertEqual(client.returncode, 125)
+        self.assertEqual(client.returncode, 255)
         self.assertIn(b"result is unknown", error)
         self.assert_never(done, 0.9)
         self.assertFalse(child_done.exists())
@@ -230,6 +293,20 @@ class ServerTests(ClientHarness):
         output, error = client.communicate(timeout=6)
         self.assertEqual(client.returncode, 0, error)
         self.assertEqual(output, b"\0" * 2000000)
+
+    def test_continuously_slow_reader_keeps_all_output(self):
+        payload_size = 131072
+        with self.connect(f"dd if=/dev/zero bs=65536 count=2 2>/dev/null", "steady-reader") as conn:
+            received = b""
+            started = time.monotonic()
+            while True:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                received += chunk
+                time.sleep(0.07)
+        self.assertGreater(time.monotonic() - started, 3)
+        self.assertTrue(received == b"\0" * payload_size + MARKER + b"0\n", f"received {len(received)} bytes; tail={received[-250:]!r}")
 
     def test_closed_stdout_is_explained(self):
         client = subprocess.Popen([sys.executable, str(ROOT / "desk"), "head -c 200000 /dev/zero"],
@@ -283,9 +360,9 @@ class ServerTests(ClientHarness):
                 if not chunk:
                     break
                 received += chunk
-        self.assertIn(b"bytes of output were not delivered", received)
-        self.assertIn(b"Command exit status: 7", received)
-        self.assertTrue(received.endswith(MARKER + b"125\n"))
+        self.assertTrue(b"bytes of output were not delivered" in received, f"missing output-loss notice; tail={received[-250:]!r}")
+        self.assertTrue(b"Command exit status: 7" in received, f"missing actual status; tail={received[-250:]!r}")
+        self.assertTrue(received.endswith(MARKER + b"255\n"))
 
     def test_process_substitution_tail_is_forwarded(self):
         result = self.client("exec > >(sleep 0.3; cat) 2>&1; echo last-line")

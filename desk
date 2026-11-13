@@ -17,7 +17,8 @@ import uuid
 
 SOCKET = os.path.expanduser("~/Library/Application Support/Desk Runner/runner.sock")
 MARKER = b"\x00DESK_RC="
-TRANSPORT_ERROR = 125
+# Above 127 makes git bisect run abort instead of treating transport loss as a skipped commit.
+TRANSPORT_ERROR = 255
 
 
 def report(message: str) -> None:
