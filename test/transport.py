@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """No GUI actions. Optionally pass a -D DESK_RUNNER_TESTING server binary."""
+import errno
 import io
 import json
 import os
@@ -123,8 +124,10 @@ class TransportTests(ClientHarness):
              mock.patch.object(entry.__globals__["select"], "poll", return_value=poller), \
              mock.patch.object(sys, "argv", ["desk", "ignored"]), \
              mock.patch.object(sys, "stdout", SimpleNamespace(buffer=output)), \
-             mock.patch.object(sys, "stderr", error):
+             mock.patch.object(sys, "stderr", error), \
+             mock.patch.object(entry.__globals__["subprocess"], "run") as launch:
             status = entry("socket-error-request")
+        launch.assert_not_called()
         self.assertEqual(status, 255)
         self.assertIn("connection failed", error.getvalue())
         self.assertIn("socket-error-request", error.getvalue())
@@ -190,7 +193,82 @@ class TransportTests(ClientHarness):
     def test_unavailable_service(self):
         result = self.client()
         self.assertEqual(result.returncode, 255)
-        self.assertIn(b"isn't running", result.stderr)
+        self.assertIn(b"Cannot connect", result.stderr)
+
+
+class StartupTests(unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(str(ROOT / "desk"))
+        self.connect = self.module["connect_client"]
+        self.globals = self.connect.__globals__
+
+    def test_running_service_needs_no_launch_request(self):
+        client = mock.MagicMock()
+        with mock.patch.object(self.globals["socket"], "socket", return_value=client), \
+             mock.patch.object(self.globals["subprocess"], "run") as launch:
+            self.assertIs(self.connect(), client)
+        launch.assert_not_called()
+
+    def test_refused_or_missing_socket_opens_exact_app_and_waits(self):
+        for code in [errno.ECONNREFUSED, errno.ENOENT]:
+            with self.subTest(code=code):
+                first, waiting, ready = [mock.MagicMock() for _ in range(3)]
+                first.connect.side_effect = OSError(code, "not ready")
+                waiting.connect.side_effect = OSError(errno.ENOENT, "starting")
+                with mock.patch.object(self.globals["socket"], "socket", side_effect=[first, waiting, ready]), \
+                     mock.patch.object(self.globals["os"].path, "isfile", return_value=True), \
+                     mock.patch.object(self.globals["subprocess"], "run") as launch, \
+                     mock.patch.object(self.globals["time"], "sleep"):
+                    self.assertIs(self.connect(), ready)
+                self.assertEqual(launch.call_args.args[0], ["/usr/bin/open", "-g", "-a", self.globals["APP"]])
+                self.assertEqual(launch.call_count, 1)
+                self.assertEqual(ready.settimeout.call_args_list[-1], mock.call(None))
+                first.close.assert_called_once()
+                waiting.close.assert_called_once()
+                for client in [first, waiting, ready]:
+                    client.sendall.assert_not_called()
+
+    def test_permission_failure_never_launches_app(self):
+        client = mock.MagicMock()
+        client.connect.side_effect = PermissionError(errno.EACCES, "denied")
+        with mock.patch.object(self.globals["socket"], "socket", return_value=client), \
+             mock.patch.object(self.globals["subprocess"], "run") as launch:
+            with self.assertRaises(PermissionError):
+                self.connect()
+        launch.assert_not_called()
+        client.close.assert_called_once()
+
+    def test_missing_app_never_launches_something_else(self):
+        client = mock.MagicMock()
+        client.connect.side_effect = FileNotFoundError(errno.ENOENT, "missing socket")
+        with mock.patch.object(self.globals["socket"], "socket", return_value=client), \
+             mock.patch.object(self.globals["os"].path, "isfile", return_value=False), \
+             mock.patch.object(self.globals["subprocess"], "run") as launch:
+            with self.assertRaises(FileNotFoundError):
+                self.connect()
+        launch.assert_not_called()
+
+    def test_start_timeout_is_bounded_and_never_submits_a_command(self):
+        client = mock.MagicMock()
+        client.connect.side_effect = ConnectionRefusedError(errno.ECONNREFUSED, "not ready")
+        with mock.patch.object(self.globals["socket"], "socket", return_value=client), \
+             mock.patch.object(self.globals["os"].path, "isfile", return_value=True), \
+             mock.patch.object(self.globals["subprocess"], "run") as launch, \
+             mock.patch.object(self.globals["time"], "monotonic", side_effect=[0, 11]):
+            with self.assertRaises(TimeoutError):
+                self.connect()
+        self.assertEqual(launch.call_count, 1)
+        client.sendall.assert_not_called()
+
+    def test_launch_error_is_reported_without_submitting_a_command(self):
+        client = mock.MagicMock()
+        client.connect.side_effect = ConnectionRefusedError(errno.ECONNREFUSED, "not ready")
+        with mock.patch.object(self.globals["socket"], "socket", return_value=client), \
+             mock.patch.object(self.globals["os"].path, "isfile", return_value=True), \
+             mock.patch.object(self.globals["subprocess"], "run", side_effect=subprocess.TimeoutExpired("open", 10)):
+            with self.assertRaisesRegex(OSError, "could not open"):
+                self.connect()
+        client.sendall.assert_not_called()
 
 
 @unittest.skipUnless(SERVER, "set DESK_RUNNER_TEST_BINARY for isolated Swift tests")

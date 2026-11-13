@@ -2,6 +2,7 @@
 """Exercise update barriers on real temporary Unix sockets, with no GUI actions."""
 import hashlib
 import json
+import plistlib
 from pathlib import Path
 import socket
 import subprocess
@@ -177,6 +178,8 @@ class InstallTests(unittest.TestCase):
              mock.patch("subprocess.run", side_effect=run), \
              mock.patch("builtins.print"):
             idle_update.install_prepared(self.root, self.stage, self.home)
+        agent = self.home / "Library/LaunchAgents/com.mikecann.desk-runner.plist"
+        self.assertEqual(plistlib.loads(agent.read_bytes())["AssociatedBundleIdentifiers"], ["com.mikecann.desk-runner"])
         self.assertEqual(self.app_binary.read_bytes(), b"new app")
         self.assertEqual(self.helper.read_bytes(), b"new helper")
         self.assertEqual(self.hash_file.read_text().strip(), (self.stage / "source-hash").read_text())

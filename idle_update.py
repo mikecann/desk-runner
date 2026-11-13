@@ -177,6 +177,7 @@ def install_prepared(root, stage, home=None):
             agent.parent.mkdir(parents=True, exist_ok=True)
             agent.write_bytes(plistlib.dumps({
                 "Label": "com.mikecann.desk-runner",
+                "AssociatedBundleIdentifiers": ["com.mikecann.desk-runner"],
                 "ProgramArguments": [str(app / "Contents/MacOS/desk-runner")],
                 "RunAtLoad": True,
                 "KeepAlive": True,

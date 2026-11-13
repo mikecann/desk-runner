@@ -6,11 +6,13 @@ Accessibility permission.
   desk < script.sh
   desk --permissions
 """
+import errno
 import json
 import os
 import select
 import socket
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -19,6 +21,8 @@ SOCKET = os.path.expanduser("~/Library/Application Support/Desk Runner/runner.so
 MARKER = b"\x00DESK_RC="
 # Above 127 makes git bisect run abort instead of treating transport loss as a skipped commit.
 TRANSPORT_ERROR = 255
+APP = os.path.expanduser("~/Applications/Desk Runner.app")
+STARTUP_TIMEOUT = 10.0
 
 
 def report(message: str) -> None:
@@ -30,6 +34,49 @@ def report(message: str) -> None:
             os.dup2(sink.fileno(), sys.stderr.fileno())
 
 
+def connect_client():
+    """Wake the installed app only before a command has been submitted.
+
+    launchd can defer RunAtLoad/KeepAlive in on-demand-only mode after login.
+    Launch Services is an explicit demand and reuses an already running app.
+    Never kickstart the separate legacy job: that could start a second server.
+    """
+    recoverable = (errno.ENOENT, errno.ECONNREFUSED)
+    def attempt(timeout):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.settimeout(timeout)
+            client.connect(SOCKET)
+            client.settimeout(None)
+        except OSError:
+            client.close()
+            raise
+        return client
+
+    try:
+        return attempt(STARTUP_TIMEOUT)
+    except OSError as error:
+        if error.errno not in recoverable or not os.path.isfile(os.path.join(APP, "Contents/MacOS/desk-runner")):
+            raise
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+    try:
+        subprocess.run(["/usr/bin/open", "-g", "-a", APP], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                       timeout=STARTUP_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise OSError(errno.ECONNREFUSED, f"could not open the installed Desk Runner app: {error}") from error
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(errno.ETIMEDOUT, "Desk Runner did not become ready within 10 seconds")
+        try:
+            return attempt(remaining)
+        except OSError as error:
+            if error.errno not in recoverable:
+                raise
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+
 def main(request_id: str) -> int:
     if sys.argv[1:] == ["--permissions"]:
         command = "__permissions"
@@ -38,11 +85,11 @@ def main(request_id: str) -> int:
     else:
         command = sys.stdin.read()
     started = time.monotonic()
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        client.connect(SOCKET)
+        client = connect_client()
     except OSError as error:
-        report(f"Desk Runner isn't running ({error}). Start it with: open -a 'Desk Runner'")
+        report(f"Cannot connect to Desk Runner ({error}); no command was submitted. "
+               f"Start it with: open -g -a '{APP}'")
         return TRANSPORT_ERROR
     held = b""
     failure = "connection closed before an exit status arrived"
