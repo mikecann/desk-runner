@@ -38,9 +38,10 @@ desk 'deskctl windows'                    # on-screen windows with their bounds
 
 The login agent requests startup at login. macOS can defer it while the user
 session is in on-demand-only mode. On first use, if the socket is missing or
-refuses the connection, `desk` opens the installed app in the background and
-waits up to 10 seconds for it to become ready. Launch Services reuses an app
-that's already running. Recovery happens before sending any command; a lost
+refuses the connection, `desk` explicitly starts the registered login agent
+and waits up to 15 seconds for it to become ready. It uses `kickstart` without
+`-k`, so a running managed job is left alone. Startup and installation share
+a lock, so recovery won't launch anything during an update. Recovery happens before sending any command; a lost
 connection after submission is reported without replaying the command.
 
 From another machine: `ssh host '~/.local/bin/desk "deskctl windows"'`.

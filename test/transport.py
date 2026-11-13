@@ -19,6 +19,9 @@ from unittest import mock
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from idle_update import startup_lock
+
 SERVER = os.environ.get("DESK_RUNNER_TEST_BINARY")
 MARKER = b"\0DESK_RC="
 
@@ -201,6 +204,9 @@ class StartupTests(unittest.TestCase):
         self.module = runpy.run_path(str(ROOT / "desk"))
         self.connect = self.module["connect_client"]
         self.globals = self.connect.__globals__
+        self.temp = tempfile.TemporaryDirectory(prefix="desk-startup-unit-", dir="/tmp")
+        self.addCleanup(self.temp.cleanup)
+        self.globals["SOCKET"] = str(Path(self.temp.name) / "runner.sock")
 
     def test_running_service_needs_no_launch_request(self):
         client = mock.MagicMock()
@@ -209,7 +215,7 @@ class StartupTests(unittest.TestCase):
             self.assertIs(self.connect(), client)
         launch.assert_not_called()
 
-    def test_refused_or_missing_socket_opens_exact_app_and_waits(self):
+    def test_refused_or_missing_socket_demands_managed_job_and_waits(self):
         for code in [errno.ECONNREFUSED, errno.ENOENT]:
             with self.subTest(code=code):
                 first, waiting, ready = [mock.MagicMock() for _ in range(3)]
@@ -220,7 +226,7 @@ class StartupTests(unittest.TestCase):
                      mock.patch.object(self.globals["subprocess"], "run") as launch, \
                      mock.patch.object(self.globals["time"], "sleep"):
                     self.assertIs(self.connect(), ready)
-                self.assertEqual(launch.call_args.args[0], ["/usr/bin/open", "-g", "-a", self.globals["APP"]])
+                self.assertEqual(launch.call_args.args[0], ["/bin/launchctl", "kickstart", self.globals["SERVICE_LABEL"]])
                 self.assertEqual(launch.call_count, 1)
                 self.assertEqual(ready.settimeout.call_args_list[-1], mock.call(None))
                 first.close.assert_called_once()
@@ -248,13 +254,38 @@ class StartupTests(unittest.TestCase):
                 self.connect()
         launch.assert_not_called()
 
+    def test_update_lock_prevents_recovery(self):
+        client = mock.MagicMock()
+        client.connect.side_effect = FileNotFoundError(errno.ENOENT, "socket parked")
+        with startup_lock(Path(self.globals["SOCKET"]).parent), \
+             mock.patch.object(self.globals["socket"], "socket", return_value=client), \
+             mock.patch.object(self.globals["os"].path, "isfile", return_value=True), \
+             mock.patch.object(self.globals["subprocess"], "run") as launch:
+            with self.assertRaises(OSError) as error:
+                self.connect()
+        self.assertEqual(error.exception.errno, errno.EBUSY)
+        launch.assert_not_called()
+        client.sendall.assert_not_called()
+
+    def test_older_updater_marker_prevents_recovery(self):
+        Path(self.globals["SOCKET"]).with_name("runner.update.sock").touch()
+        client = mock.MagicMock()
+        client.connect.side_effect = FileNotFoundError(errno.ENOENT, "socket parked")
+        with mock.patch.object(self.globals["socket"], "socket", return_value=client), \
+             mock.patch.object(self.globals["os"].path, "isfile", return_value=True), \
+             mock.patch.object(self.globals["subprocess"], "run") as launch:
+            with self.assertRaises(OSError) as error:
+                self.connect()
+        self.assertEqual(error.exception.errno, errno.EBUSY)
+        launch.assert_not_called()
+
     def test_start_timeout_is_bounded_and_never_submits_a_command(self):
         client = mock.MagicMock()
         client.connect.side_effect = ConnectionRefusedError(errno.ECONNREFUSED, "not ready")
         with mock.patch.object(self.globals["socket"], "socket", return_value=client), \
              mock.patch.object(self.globals["os"].path, "isfile", return_value=True), \
              mock.patch.object(self.globals["subprocess"], "run") as launch, \
-             mock.patch.object(self.globals["time"], "monotonic", side_effect=[0, 11]):
+             mock.patch.object(self.globals["time"], "monotonic", side_effect=[0, 16]):
             with self.assertRaises(TimeoutError):
                 self.connect()
         self.assertEqual(launch.call_count, 1)
@@ -265,8 +296,8 @@ class StartupTests(unittest.TestCase):
         client.connect.side_effect = ConnectionRefusedError(errno.ECONNREFUSED, "not ready")
         with mock.patch.object(self.globals["socket"], "socket", return_value=client), \
              mock.patch.object(self.globals["os"].path, "isfile", return_value=True), \
-             mock.patch.object(self.globals["subprocess"], "run", side_effect=subprocess.TimeoutExpired("open", 10)):
-            with self.assertRaisesRegex(OSError, "could not open"):
+             mock.patch.object(self.globals["subprocess"], "run", side_effect=subprocess.TimeoutExpired("launchctl", 15)):
+            with self.assertRaisesRegex(OSError, "could not start"):
                 self.connect()
         client.sendall.assert_not_called()
 

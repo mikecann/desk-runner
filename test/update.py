@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Exercise update barriers on real temporary Unix sockets, with no GUI actions."""
+from contextlib import nullcontext
+import errno
 import hashlib
 import json
 import plistlib
@@ -145,6 +147,15 @@ class InstallTests(unittest.TestCase):
         self.hash_file = self.support / "source-hash"
         self.hash_file.write_bytes(b"old hash")
 
+    def test_in_progress_recovery_blocks_install_before_any_mutation(self):
+        with idle_update.startup_lock(self.support, shared=True), mock.patch("subprocess.run") as run:
+            with self.assertRaises(OSError) as error:
+                idle_update.install_prepared(self.root, self.stage, self.home)
+        self.assertEqual(error.exception.errno, errno.EBUSY)
+        run.assert_not_called()
+        self.assertEqual(self.app_binary.read_bytes(), b"old app")
+        self.assertEqual(self.helper.read_bytes(), b"old helper")
+
     def test_busy_install_never_stops_service_or_replaces_files(self):
         with mock.patch.object(idle_update, "service_pid", return_value=123), \
              mock.patch.object(idle_update, "service_is_idle", return_value=False), \
@@ -169,9 +180,32 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.helper.read_bytes(), b"old helper")
         self.assertEqual(self.hash_file.read_bytes(), b"old hash")
 
+    def test_rollback_demands_the_old_job_after_bootstrap(self):
+        agent = self.home / "Library/LaunchAgents/com.mikecann.desk-runner.plist"
+        agent.parent.mkdir(parents=True)
+        old_agent = plistlib.dumps({"Label": "com.mikecann.desk-runner"})
+        agent.write_bytes(old_agent)
+        bootstraps = 0
+        def run(command, **kwargs):
+            nonlocal bootstraps
+            if command[:2] == ["launchctl", "bootstrap"]:
+                bootstraps += 1
+                if bootstraps == 1:
+                    raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0)
+        with mock.patch.object(idle_update, "service_pid", return_value=123), \
+             mock.patch.object(idle_update, "idle_socket", return_value=nullcontext()), \
+             mock.patch("subprocess.run", side_effect=run) as calls:
+            with self.assertRaises(subprocess.CalledProcessError):
+                idle_update.install_prepared(self.root, self.stage, self.home)
+        self.assertEqual(bootstraps, 2)
+        self.assertEqual(calls.call_args.args[0][:2], ["launchctl", "kickstart"])
+        self.assertEqual(agent.read_bytes(), old_agent)
+        self.assertEqual(self.app_binary.read_bytes(), b"old app")
+
     def test_first_install_applies_prepared_files_and_links(self):
         def run(command, **kwargs):
-            if command[:2] == ["launchctl", "bootstrap"]:
+            if command[:2] == ["launchctl", "kickstart"]:
                 (self.support / "runner.sock").touch()
             return subprocess.CompletedProcess(command, 0)
         with mock.patch.object(idle_update, "service_pid", return_value=None), \
@@ -234,7 +268,7 @@ class InstallTests(unittest.TestCase):
         listener.close()
         self.assertTrue(idle_update.socket_is_stale(path))
         def run(command, **kwargs):
-            if command[:2] == ["launchctl", "bootstrap"]:
+            if command[:2] == ["launchctl", "kickstart"]:
                 path.touch()
             return subprocess.CompletedProcess(command, 0)
         with mock.patch.object(idle_update, "service_pid", return_value=None), \

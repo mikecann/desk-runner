@@ -10,6 +10,24 @@ class BusyError(RuntimeError):
 
 
 @contextmanager
+def startup_lock(support, shared=False):
+    """Serialize recovery with installs; readers may wake the same managed job."""
+    import errno
+    import fcntl
+    import os
+    support.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(support / "startup.lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise OSError(errno.EBUSY, "Desk Runner startup or update is in progress; retry shortly") from error
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextmanager
 def idle_socket(path: Path, is_idle, timeout=10):
     """Block new callers, drain the accept queue, then verify existing work is idle.
 
@@ -106,6 +124,13 @@ def socket_is_stale(path):
 
 
 def install_prepared(root, stage, home=None):
+    """Install only while no startup request or other installer owns the service."""
+    home = home or Path.home()
+    with startup_lock(home / "Library/Application Support/Desk Runner"):
+        _install_prepared(root, stage, home)
+
+
+def _install_prepared(root, stage, home):
     """Install a signed staged app only after the live service is demonstrably idle."""
     from contextlib import nullcontext
     import hashlib
@@ -189,6 +214,8 @@ def install_prepared(root, stage, home=None):
             os.replace(helper_ready, old_helper)
             hash_file.write_text(digest + "\n")
             subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(agent)], check=True)
+            # Explicit demand also works when macOS defers RunAtLoad/KeepAlive.
+            subprocess.run(["launchctl", "kickstart", label], check=True, timeout=15)
             for _ in range(100):
                 if sock.exists():
                     break
@@ -218,6 +245,7 @@ def install_prepared(root, stage, home=None):
                 old_helper.unlink(missing_ok=True)
             if pid:
                 subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(agent)], check=True)
+                subprocess.run(["launchctl", "kickstart", label], check=True, timeout=15)
         if ready.exists():
             shutil.rmtree(ready)
         if installed and previous.exists():

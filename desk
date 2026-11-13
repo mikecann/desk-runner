@@ -16,13 +16,20 @@ import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
+
+# Follow the installed symlink back to its repo for the installer/recovery lock.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from idle_update import startup_lock
 
 SOCKET = os.path.expanduser("~/Library/Application Support/Desk Runner/runner.sock")
 MARKER = b"\x00DESK_RC="
 # Above 127 makes git bisect run abort instead of treating transport loss as a skipped commit.
 TRANSPORT_ERROR = 255
 APP = os.path.expanduser("~/Applications/Desk Runner.app")
-STARTUP_TIMEOUT = 10.0
+# launchd can throttle a rapid respawn for 10 seconds; leave room for startup.
+STARTUP_TIMEOUT = 15.0
+SERVICE_LABEL = f"gui/{os.getuid()}/com.mikecann.desk-runner"
 
 
 def report(message: str) -> None:
@@ -35,11 +42,11 @@ def report(message: str) -> None:
 
 
 def connect_client():
-    """Wake the installed app only before a command has been submitted.
+    """Demand the registered login job before any command has been submitted.
 
-    launchd can defer RunAtLoad/KeepAlive in on-demand-only mode after login.
-    Launch Services is an explicit demand and reuses an already running app.
-    Never kickstart the separate legacy job: that could start a second server.
+    RunAtLoad/KeepAlive can be deferred in on-demand-only mode after login.
+    kickstart without -k starts the managed job and leaves a running job alone.
+    The shared lock prevents recovery from racing a bundle swap or bootstrap.
     """
     recoverable = (errno.ENOENT, errno.ECONNREFUSED)
     def attempt(timeout):
@@ -58,23 +65,31 @@ def connect_client():
     except OSError as error:
         if error.errno not in recoverable or not os.path.isfile(os.path.join(APP, "Contents/MacOS/desk-runner")):
             raise
-    deadline = time.monotonic() + STARTUP_TIMEOUT
-    try:
-        subprocess.run(["/usr/bin/open", "-g", "-a", APP], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                       timeout=STARTUP_TIMEOUT)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise OSError(errno.ECONNREFUSED, f"could not open the installed Desk Runner app: {error}") from error
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(errno.ETIMEDOUT, "Desk Runner did not become ready within 10 seconds")
+    with startup_lock(Path(SOCKET).parent, shared=True):
+        # Also respect an older updater that predates the shared lock.
+        if os.path.lexists(str(Path(SOCKET).with_name("runner.update.sock"))):
+            raise OSError(errno.EBUSY, "Desk Runner update is in progress; retry shortly")
+        deadline = time.monotonic() + STARTUP_TIMEOUT
         try:
-            return attempt(remaining)
-        except OSError as error:
-            if error.errno not in recoverable:
-                raise
-            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            subprocess.run(["/bin/launchctl", "kickstart", SERVICE_LABEL], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           timeout=STARTUP_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as error:
+            detail = getattr(error, "stderr", None)
+            if isinstance(detail, bytes):
+                detail = detail.decode(errors="replace").strip()[:500]
+            raise OSError(errno.ECONNREFUSED,
+                          f"could not start the registered Desk Runner agent: {detail or error}") from error
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(errno.ETIMEDOUT, "Desk Runner did not become ready within 15 seconds")
+            try:
+                return attempt(remaining)
+            except OSError as error:
+                if error.errno not in recoverable:
+                    raise
+                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
 def main(request_id: str) -> int:
@@ -89,7 +104,7 @@ def main(request_id: str) -> int:
         client = connect_client()
     except OSError as error:
         report(f"Cannot connect to Desk Runner ({error}); no command was submitted. "
-               f"Start it with: open -g -a '{APP}'")
+               f"Check its login agent with: /bin/launchctl print {SERVICE_LABEL}")
         return TRANSPORT_ERROR
     held = b""
     failure = "connection closed before an exit status arrived"
