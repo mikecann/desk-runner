@@ -188,6 +188,21 @@ class TransportTests(ClientHarness):
         self.assertEqual(result.returncode, 127)
         self.assertEqual(result.stderr, b"")
 
+    def test_incomplete_client_installation_is_a_transport_failure(self):
+        standalone = self.home / "standalone"
+        standalone.mkdir()
+        script = standalone / "desk"
+        script.write_bytes((ROOT / "desk").read_bytes())
+        for old_helper in [False, True]:
+            with self.subTest(old_helper=old_helper):
+                if old_helper:
+                    (standalone / "idle_update.py").write_text("# predates startup_lock\n")
+                result = subprocess.run([sys.executable, str(script), "exit 0"],
+                                        env=dict(self.env, PYTHONPATH=""), capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 255)
+                self.assertIn(b"client installation is incomplete", result.stderr)
+                self.assertNotIn(b"Traceback", result.stderr)
+
     def test_zero_exit(self):
         result = self.response([MARKER + b"0\n"])
         self.assertEqual(result.returncode, 0)

@@ -20,7 +20,6 @@ from pathlib import Path
 
 # Follow the installed symlink back to its repo for the installer/recovery lock.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from idle_update import startup_lock
 
 SOCKET = os.path.expanduser("~/Library/Application Support/Desk Runner/runner.sock")
 MARKER = b"\x00DESK_RC="
@@ -42,6 +41,11 @@ def report(message: str) -> None:
 
 
 def connect_client():
+    try:
+        from idle_update import startup_lock
+    except (ImportError, SyntaxError) as error:
+        raise OSError(errno.ENOENT,
+                      "Desk Runner client installation is incomplete; sync idle_update.py or reinstall") from error
     # Hold only through connect. The installer's accept-queue barrier protects
     # the connected request once this lock is released, before it is submitted.
     with startup_lock(Path(SOCKET).parent, shared=True):

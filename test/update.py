@@ -148,13 +148,21 @@ class InstallTests(unittest.TestCase):
         self.hash_file.write_bytes(b"old hash")
 
     def test_in_progress_recovery_blocks_install_before_any_mutation(self):
-        with idle_update.startup_lock(self.support, shared=True), mock.patch("subprocess.run") as run:
+        with idle_update.startup_lock(self.support, shared=True), mock.patch.object(idle_update, "service_pid", return_value=None), mock.patch("subprocess.run") as run:
             with self.assertRaises(OSError) as error:
                 idle_update.install_prepared(self.root, self.stage, self.home)
         self.assertEqual(error.exception.errno, errno.EBUSY)
         run.assert_not_called()
         self.assertEqual(self.app_binary.read_bytes(), b"old app")
         self.assertEqual(self.helper.read_bytes(), b"old helper")
+
+    def test_busy_preflight_does_not_exclude_new_clients(self):
+        with mock.patch.object(idle_update, "service_pid", return_value=123), \
+             mock.patch.object(idle_update, "service_is_idle", return_value=False), \
+             mock.patch.object(idle_update, "startup_lock") as lock:
+            with self.assertRaises(BusyError):
+                idle_update.install_prepared(self.root, self.stage, self.home)
+        lock.assert_not_called()
 
     def test_busy_install_never_stops_service_or_replaces_files(self):
         with mock.patch.object(idle_update, "service_pid", return_value=123), \

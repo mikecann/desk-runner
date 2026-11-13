@@ -126,6 +126,16 @@ def socket_is_stale(path):
 def install_prepared(root, stage, home=None):
     """Install only while no startup request or other installer owns the service."""
     home = home or Path.home()
+    # Refuse known busy services before excluding any new callers. The
+    # guarded implementation checks again after taking the lock and barrier.
+    import os
+    label = f"gui/{os.getuid()}/com.mikecann.desk-runner"
+    pid = service_pid(label)
+    if pid and not service_is_idle(label, pid):
+        raise BusyError("Desk Runner is busy; leaving it running")
+    sock = home / "Library/Application Support/Desk Runner/runner.sock"
+    if pid is None and sock.exists() and not socket_is_stale(sock):
+        raise BusyError("Desk socket is live without an inspectable service; refusing to replace it")
     with startup_lock(home / "Library/Application Support/Desk Runner"):
         _install_prepared(root, stage, home)
 
