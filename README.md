@@ -37,6 +37,23 @@ desk 'deskctl windows'                    # on-screen windows with their bounds
 
 From another machine: `ssh host '~/.local/bin/desk "deskctl windows"'`.
 
+`desk` returns the command's exit status, or `128 + signal` if it was killed
+by a signal. If the connection ends before an exit status arrives, it prints
+a diagnostic with a request ID and returns 125. The command may still be
+running, so check its process and output before running it again.
+
+If a reader stops accepting output for 30 seconds, the service keeps the command
+running and discards further output. If the reader resumes, it reports the lost
+output and the command's actual status, and returns 125. Background children
+keep running after their parent exits; their later output is discarded.
+
+The service logs request IDs, child process IDs and completion statuses without
+logging command text. To inspect them on the machine running Desk Runner:
+
+```bash
+log show --last 10m --predicate 'process == "desk-runner"'
+```
+
 Key presses clear the event's process ID so apps treat them like real typing.
 Some apps (pynput hotkeys, for one) still ignore them, because macOS fills the
 ID back in.
@@ -52,6 +69,16 @@ one. A downscaled screenshot is easy to misread by a few points, so crop the
 spot at full size first: `desk 'screencapture -x -R 80,910,120,80 crop.png'`.
 
 ## Test
+
+`python3 test/transport.py` checks the client against temporary Unix sockets.
+To also test the server's disconnect handling without touching the desktop or
+its running service:
+
+```bash
+mkdir -p build
+taskpolicy -b swiftc -D DESK_RUNNER_TESTING Sources/main.swift -o build/test-server
+DESK_RUNNER_TEST_BINARY="$PWD/build/test-server" taskpolicy -b python3 test/transport.py
+```
 
 `test/keys.sh` types into a scratch TextEdit document and checks what an event
 tap sees. It takes over the keyboard and mouse for a few seconds, so run it on

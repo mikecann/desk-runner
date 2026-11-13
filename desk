@@ -10,42 +10,94 @@ import json
 import os
 import socket
 import sys
+import time
+import uuid
 
 SOCKET = os.path.expanduser("~/Library/Application Support/Desk Runner/runner.sock")
 MARKER = b"\x00DESK_RC="
+TRANSPORT_ERROR = 125
 
 
-def main() -> int:
+def report(message: str) -> None:
+    try:
+        print(message, file=sys.stderr)
+    except BrokenPipeError:
+        # stderr may share stdout's closed pipe (desk ... 2>&1 | head).
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), sys.stderr.fileno())
+
+
+def main(request_id: str) -> int:
     if sys.argv[1:] == ["--permissions"]:
         command = "__permissions"
     elif len(sys.argv) > 1:
         command = " ".join(sys.argv[1:])
     else:
         command = sys.stdin.read()
+    started = time.monotonic()
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         client.connect(SOCKET)
     except OSError as error:
-        print(f"Desk Runner isn't running ({error}). Start it with: open -a 'Desk Runner'", file=sys.stderr)
+        report(f"Desk Runner isn't running ({error}). Start it with: open -a 'Desk Runner'")
         return 127
-    client.sendall((json.dumps({"cmd": command, "cwd": os.getcwd()}) + "\n").encode())
     held = b""
-    while True:
-        chunk = client.recv(65536)
-        if not chunk:
-            break
-        held += chunk
-        # Keep back enough to spot the exit-code marker if it's split.
-        cut = held.rfind(MARKER)
-        safe = cut if cut >= 0 else max(0, len(held) - len(MARKER) - 8)
-        sys.stdout.buffer.write(held[:safe])
-        sys.stdout.buffer.flush()
-        held = held[safe:]
+    failure = "connection closed before an exit status arrived"
+    with client:
+        try:
+            client.sendall((json.dumps({"cmd": command, "cwd": os.getcwd(), "id": request_id}) + "\n").encode())
+        except OSError as error:
+            failure = f"connection failed: {error}"
+        else:
+            while True:
+                try:
+                    chunk = client.recv(65536)
+                except OSError as error:
+                    failure = f"connection failed: {error}"
+                    break
+                if not chunk:
+                    break
+                held += chunk
+                # Keep back enough to spot the exit-code marker if it's split.
+                cut = held.rfind(MARKER)
+                if cut >= 0:
+                    safe = cut
+                else:
+                    # Ordinary output can be flushed immediately. Only a suffix
+                    # matching the start of the marker needs another read.
+                    keep = max((n for n in range(1, len(MARKER)) if held.endswith(MARKER[:n])), default=0)
+                    safe = len(held) - keep
+                sys.stdout.buffer.write(held[:safe])
+                sys.stdout.buffer.flush()
+                held = held[safe:]
     if held.startswith(MARKER):
-        return int(held[len(MARKER):].strip() or 1)
+        status = held[len(MARKER):].strip()
+        if held.endswith(b"\n") and status.isdigit() and len(status) <= 3 and 0 <= int(status) <= 255:
+            return int(status)
+        failure = "invalid or incomplete exit status from the service"
     sys.stdout.buffer.write(held)
-    return 1
+    sys.stdout.buffer.flush()
+    report(
+        f"Desk Runner: {failure} (request {request_id}, after {time.monotonic() - started:.1f}s). "
+        "The command's result is unknown; it may still be running. "
+        "Check its process/output before retrying. "
+        "Service logs: log show --last 10m --predicate 'process == \"desk-runner\"'."
+    )
+    return TRANSPORT_ERROR
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    request_id = uuid.uuid4().hex
+    try:
+        sys.exit(main(request_id))
+    except KeyboardInterrupt:
+        report(f"Desk Runner: interrupted (request {request_id}); result unknown. "
+               "The command may still be running. Check its process/output before retrying.")
+        sys.exit(130)
+    except BrokenPipeError:
+        # Prevent a second exception when Python flushes stdout during shutdown.
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        report("Desk Runner: output consumer closed; the command may still be running. "
+               "Check its process/output before retrying.")
+        sys.exit(141)
