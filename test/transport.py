@@ -140,9 +140,20 @@ class ServerTests(ClientHarness):
         conn.sendall((json.dumps({"cmd": command, "id": request_id}) + "\n").encode())
         return conn
 
-    def test_disconnect_does_not_kill_other_request_or_server(self):
-        with self.connect("sleep 0.3; printf survivor", "survivor") as survivor:
-            with self.connect("printf ready; sleep 0.1; printf after-disconnect", "disconnect") as abandoned:
+    def wait_for(self, path, seconds=3):
+        deadline = time.monotonic() + seconds
+        while not path.exists():
+            self.assertLess(time.monotonic(), deadline, f"{path.name} never appeared")
+            time.sleep(0.01)
+
+    def assert_never(self, path, seconds):
+        time.sleep(seconds)
+        self.assertFalse(path.exists(), f"{path.name} appeared: the command outlived its supervisor")
+
+    def test_disconnect_cancels_only_that_request(self):
+        abandoned_done = self.home / "abandoned-done"
+        with self.connect("sleep 0.6; printf survivor", "survivor") as survivor:
+            with self.connect(f"printf ready; sleep 0.4; touch {abandoned_done}", "disconnect") as abandoned:
                 self.assertIn(b"ready", abandoned.recv(1024))
             received = b""
             while True:
@@ -152,35 +163,65 @@ class ServerTests(ClientHarness):
                 received += chunk
         self.assertIsNone(self.server.poll(), "a disconnected client killed the server")
         self.assertEqual(received, b"survivor" + MARKER + b"0\n")
+        self.assert_never(abandoned_done, 0.3)
         self.assertEqual(self.client("exit 7").returncode, 7)
         self.logs.seek(0)
         logs = self.logs.read()
-        self.assertIn(b"request=disconnect client disconnected", logs)
-        self.assertIn(b"request=disconnect child=", logs)
-        self.assertRegex(logs, rb"request=disconnect child=\d+ finished status=0")
+        self.assertIn(b"request=disconnect client hung up", logs)
+        self.assertRegex(logs, rb"request=disconnect child=\d+ cancelled")
+        self.assertNotRegex(logs, rb"request=survivor child=\d+ cancelled")
+
+    def test_disconnect_stops_the_commands_children(self):
+        child_done = self.home / "child-done"
+        with self.connect(f"(sleep 0.5; touch {child_done}) & printf ready; wait", "children") as conn:
+            self.assertIn(b"ready", conn.recv(1024))
+        self.assert_never(child_done, 0.8)
+
+    def test_disconnect_with_closed_output_still_cancels(self):
+        started = self.home / "quiet-started"
+        done = self.home / "quiet-done"
+        with self.connect(f"exec >/dev/null 2>&1; touch {started}; sleep 0.5; touch {done}", "quiet"):
+            self.wait_for(started)
+        self.assert_never(done, 0.8)
+
+    def test_command_ignoring_sigterm_is_killed(self):
+        started = self.home / "stubborn-started"
+        done = self.home / "stubborn-done"
+        with self.connect(f"trap '' TERM; touch {started}; sleep 4.5; touch {done}", "stubborn"):
+            self.wait_for(started)
+        self.assert_never(done, 5)
+
+    def test_server_crash_stops_running_command(self):
+        started = self.home / "crash-started"
+        done = self.home / "crash-done"
+        child_done = self.home / "crash-child-done"
+        client = subprocess.Popen([sys.executable, str(ROOT / "desk"),
+                                   f"(sleep 0.6; touch {child_done}) & touch {started}; sleep 0.6; touch {done}"],
+                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: client.poll() is None and client.kill())
+        self.wait_for(started)
+        # Only this test's isolated service is killed, never the desktop agent.
+        self.server.kill()
+        self.server.wait(timeout=5)
+        _, error = client.communicate(timeout=5)
+        self.assertEqual(client.returncode, 125)
+        self.assertIn(b"result is unknown", error)
+        self.assert_never(done, 0.9)
+        self.assertFalse(child_done.exists())
+
+    def test_background_job_survives_server_exit_after_parent_finished(self):
+        finished = self.home / "detached-finished"
+        result = self.client(f"(sleep 0.6; touch {finished}) &")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.server.kill()
+        self.server.wait(timeout=5)
+        self.wait_for(finished)
 
     def test_signalled_command_has_shell_status_and_explanation(self):
         result = self.client("kill -TERM $$")
         self.assertEqual(result.returncode, 143)
         self.assertIn(b"terminated by signal 15", result.stdout)
         self.assertEqual(self.client("exit 0").returncode, 0)
-
-    def test_service_loss_is_explained(self):
-        started = self.home / "started"
-        client = subprocess.Popen([sys.executable, str(ROOT / "desk"),
-                                   f"touch {started}; sleep 0.3"],
-                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        deadline = time.monotonic() + 15
-        self.addCleanup(lambda: client.poll() is None and client.kill())
-        while not started.exists():
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.02)
-        # Only this test's isolated service is killed, never the desktop agent.
-        self.server.terminate()
-        self.server.wait(timeout=5)
-        _, error = client.communicate(timeout=5)
-        self.assertEqual(client.returncode, 125)
-        self.assertIn(b"result is unknown", error)
 
     def test_slow_stdout_preserves_all_output(self):
         client = subprocess.Popen([sys.executable, str(ROOT / "desk"), "head -c 2000000 /dev/zero"],
@@ -199,6 +240,22 @@ class ServerTests(ClientHarness):
         self.assertEqual(client.returncode, 141)
         self.assertIn(b"output consumer closed", error)
         self.assertNotIn(b"Traceback", error)
+
+    def test_quiet_command_stops_when_output_reader_goes_away(self):
+        # What a dropped SSH session looks like to desk: its stdout's reader is
+        # gone, but the command prints nothing that would hit the broken pipe.
+        started = self.home / "quiet-reader-started"
+        done = self.home / "quiet-reader-done"
+        client = subprocess.Popen([sys.executable, str(ROOT / "desk"),
+                                   f"touch {started}; sleep 1.5; touch {done}"],
+                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.wait_for(started)
+        client.stdout.close()
+        client.stdout = None
+        _, error = client.communicate(timeout=6)
+        self.assertEqual(client.returncode, 141)
+        self.assertIn(b"output consumer closed", error)
+        self.assert_never(done, 1.5)
 
     def test_closed_combined_output_has_no_traceback(self):
         client = subprocess.Popen([sys.executable, str(ROOT / "desk"), "head -c 200000 /dev/zero"],
@@ -239,24 +296,19 @@ class ServerTests(ClientHarness):
         result = self.client("exec >/dev/null 2>&1; sleep 0.1; exit 7")
         self.assertEqual(result.returncode, 7)
 
-    def test_interrupt_explains_that_child_continues(self):
+    def test_interrupt_stops_the_command(self):
         started = self.home / "interrupt-started"
         finished = self.home / "interrupt-finished"
         with subprocess.Popen([sys.executable, str(ROOT / "desk"),
-                               f"touch {started}; sleep 0.3; touch {finished}"],
+                               f"touch {started}; sleep 0.4; touch {finished}"],
                               env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as client:
-            deadline = time.monotonic() + 3
-            while not started.exists():
-                self.assertLess(time.monotonic(), deadline)
-                time.sleep(0.01)
+            self.wait_for(started)
             client.send_signal(signal.SIGINT)
             _, error = client.communicate(timeout=5)
         self.assertEqual(client.returncode, 130)
-        self.assertIn(b"may still be running", error)
+        self.assertIn(b"stops the command", error)
         self.assertNotIn(b"Traceback", error)
-        while not finished.exists():
-            self.assertLess(time.monotonic(), deadline, "interrupt cancelled the child")
-            time.sleep(0.01)
+        self.assert_never(finished, 0.7)
 
     def test_stalled_reader_does_not_stall_command_forever(self):
         finished = self.home / "finished"

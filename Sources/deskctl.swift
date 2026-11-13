@@ -76,9 +76,13 @@ func postKey(_ code: CGKeyCode, down: Bool, flags: CGEventFlags) {
 // Modifiers that are down right now, so a Ctrl-C or kill during `hold` can let
 // them go instead of leaving the desk with Shift stuck down.
 var modifiersDown: [CGKeyCode] = []
+// Same for a drag: Desk Runner stops a command whose client goes away, and a
+// drag cut off mid-way would otherwise leave the left button held.
+var dragButtonDown = false
 for sig in [SIGINT, SIGTERM, SIGHUP] {
     signal(sig) { sig in
         for code in modifiersDown.reversed() { postKey(code, down: false, flags: []) }
+        if dragButtonDown { post(.leftMouseUp, pointer()) }
         exit(128 + sig)
     }
 }
@@ -183,11 +187,13 @@ case "click", "rightclick":
     }
 case "drag":
     glide(to: CGPoint(x: n[0], y: n[1]), seconds: 0.5)
+    dragButtonDown = true
     post(.leftMouseDown, CGPoint(x: n[0], y: n[1]))
     usleep(120_000)
     glide(to: CGPoint(x: n[2], y: n[3]), seconds: n.count > 4 ? n[4] : 0.8, dragging: true)
     usleep(120_000)
     post(.leftMouseUp, CGPoint(x: n[2], y: n[3]))
+    dragButtonDown = false
 case "type":
     type(args[0], perKey: args.count > 1 ? Double(args[1]) ?? 0.04 : 0.04)
 case "key":

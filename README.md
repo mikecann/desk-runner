@@ -39,19 +39,31 @@ From another machine: `ssh host '~/.local/bin/desk "deskctl windows"'`.
 
 `desk` returns the command's exit status, or `128 + signal` if it was killed
 by a signal. If the connection ends before an exit status arrives, it prints
-a diagnostic with a request ID and returns 125. The command may still be
-running, so check its process and output before running it again.
+a diagnostic with a request ID and returns 125.
 
-If a reader stops accepting output for 30 seconds, the service keeps the command
-running and discards further output. If the reader resumes, it reports the lost
-output and the command's actual status, and returns 125. Background children
-keep running after their parent exits; their later output is discarded.
+A command never outlives whoever is watching it, so a script can't go on
+clicking and typing after nobody can see its result. If `desk` goes away
+(Ctrl-C, a dropped SSH session, a closed output pipe) or Desk Runner itself
+stops, crashes or restarts mid-command, the command and everything it started
+are sent SIGTERM, then SIGKILL two seconds later. A small guard process per
+command does this, so it works even when Desk Runner is gone. Anything the
+command already did (a click, a file) stays done, so check before retrying.
+`deskctl` lets go of held keys and a dragged mouse button when it's stopped.
+
+Background jobs that are still running when the command exits normally are
+left alone, and keep running even if Desk Runner restarts later; their output
+is discarded.
+
+If a reader that's still connected stops accepting output for 30 seconds, the
+service keeps the command running and discards further output. If the reader
+resumes, it reports the lost output and the command's actual status, and
+returns 125.
 
 The service logs request IDs, child process IDs and completion statuses without
 logging command text. To inspect them on the machine running Desk Runner:
 
 ```bash
-log show --last 10m --predicate 'process == "desk-runner"'
+log show --last 10m --style compact --predicate 'subsystem == "com.mikecann.desk-runner"'
 ```
 
 Key presses clear the event's process ID so apps treat them like real typing.

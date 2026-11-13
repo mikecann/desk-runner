@@ -8,7 +8,9 @@ Accessibility permission.
 """
 import json
 import os
+import select
 import socket
+import stat
 import sys
 import time
 import uuid
@@ -49,7 +51,20 @@ def main(request_id: str) -> int:
         except OSError as error:
             failure = f"connection failed: {error}"
         else:
+            # A dropped SSH session closes our stdout, but a quiet command
+            # would never write to find out. macOS flags a pipe whose reader
+            # is gone as POLLHUP; leaving then makes the service stop the command.
+            waiter = select.poll()
+            waiter.register(client, select.POLLIN)
+            watch_stdout = stat.S_ISFIFO(os.fstat(1).st_mode) or stat.S_ISSOCK(os.fstat(1).st_mode)
+            stdout_watcher = select.poll()
+            stdout_watcher.register(1, select.POLLOUT)
             while True:
+                if not waiter.poll(1000):
+                    if watch_stdout and any(e & (select.POLLHUP | select.POLLERR)
+                                            for _, e in stdout_watcher.poll(0)):
+                        raise BrokenPipeError
+                    continue
                 try:
                     chunk = client.recv(65536)
                 except OSError as error:
@@ -79,9 +94,9 @@ def main(request_id: str) -> int:
     sys.stdout.buffer.flush()
     report(
         f"Desk Runner: {failure} (request {request_id}, after {time.monotonic() - started:.1f}s). "
-        "The command's result is unknown; it may still be running. "
-        "Check its process/output before retrying. "
-        "Service logs: log show --last 10m --predicate 'process == \"desk-runner\"'."
+        "The command's result is unknown. If the service went away, it stopped the command "
+        "too, but anything already done (clicks, files) stays done, so check before retrying. "
+        "Service logs: log show --last 10m --predicate 'subsystem == \"com.mikecann.desk-runner\"'."
     )
     return TRANSPORT_ERROR
 
@@ -91,13 +106,13 @@ if __name__ == "__main__":
     try:
         sys.exit(main(request_id))
     except KeyboardInterrupt:
-        report(f"Desk Runner: interrupted (request {request_id}); result unknown. "
-               "The command may still be running. Check its process/output before retrying.")
+        report(f"Desk Runner: interrupted (request {request_id}). The service stops the command "
+               "when its client goes away; check what it already did before retrying.")
         sys.exit(130)
     except BrokenPipeError:
         # Prevent a second exception when Python flushes stdout during shutdown.
         with open(os.devnull, "wb") as sink:
             os.dup2(sink.fileno(), sys.stdout.fileno())
-        report("Desk Runner: output consumer closed; the command may still be running. "
-               "Check its process/output before retrying.")
+        report("Desk Runner: output consumer closed, so the command was stopped. "
+               "Check what it already did before retrying.")
         sys.exit(141)
