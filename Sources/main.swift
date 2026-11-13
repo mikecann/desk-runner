@@ -83,6 +83,10 @@ final class Connection {
         close(fd)
     }
 
+    func fail(_ message: String) {
+        finish(Data("Desk Runner: \(message) (request \(id)).\n\(rcMarker)\(transportError)\n".utf8))
+    }
+
     private func writeAll(_ data: Data) {
         data.withUnsafeBytes { raw in
             guard var p = raw.baseAddress else { return }
@@ -323,7 +327,7 @@ func handle(_ fd: Int32) {
     let connection = Connection(fd, id: id)
     defer { connection.finish() }
     guard let request, let command = request["cmd"] as? String else {
-        connection.send(Data("bad request\n\(rcMarker)2\n".utf8))
+        connection.fail("bad request")
         return
     }
     if command == "__permissions" {
@@ -339,7 +343,7 @@ func handle(_ fd: Int32) {
 
     var fds: [Int32] = [0, 0]
     guard pipe(&fds) == 0 else {
-        connection.finish(Data("Desk Runner: could not create command output.\n\(rcMarker)127\n".utf8))
+        connection.fail("could not create command output")
         return
     }
     let pipeFD = fds[0]
@@ -350,7 +354,7 @@ func handle(_ fd: Int32) {
     guard flags >= 0, fcntl(pipeFD, F_SETFL, flags | O_NONBLOCK) == 0 else {
         note("request=%@ could not configure output pipe: errno=%d", id, errno)
         close(fds[0]); close(fds[1])
-        connection.finish(Data("Desk Runner: could not configure command output.\n\(rcMarker)127\n".utf8))
+        connection.fail("could not configure command output")
         return
     }
     // Start the guard before the command, so there is no moment where the
@@ -358,7 +362,7 @@ func handle(_ fd: Int32) {
     guard let lifeline = Lifeline(id: id) else {
         note("request=%@ could not start guard: errno=%d", id, errno)
         close(fds[0]); close(fds[1])
-        connection.finish(Data("Desk Runner: could not start the command's guard.\n\(rcMarker)127\n".utf8))
+        connection.fail("could not start the command's guard")
         return
     }
     let null = open("/dev/null", O_RDONLY | O_CLOEXEC)
@@ -371,7 +375,7 @@ func handle(_ fd: Int32) {
         note("request=%@ could not start: errno=%d", id, spawnError)
         lifeline.cut()
         close(pipeFD)
-        connection.send(Data("could not start: \(String(cString: strerror(spawnError)))\n\(rcMarker)127\n".utf8))
+        connection.fail("could not start: \(String(cString: strerror(spawnError)))")
         return
     }
     note("request=%@ child=%d started in group %d", id, pid, lifeline.group)

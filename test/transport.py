@@ -213,11 +213,11 @@ class ServerTests(ClientHarness):
         self.logs.close()
         super().tearDown()
 
-    def connect(self, command, request_id):
+    def connect(self, command, request_id, **options):
         conn = socket.socket(socket.AF_UNIX)
         conn.settimeout(5)
         conn.connect(self.path)
-        conn.sendall((json.dumps({"cmd": command, "id": request_id}) + "\n").encode())
+        conn.sendall((json.dumps({"cmd": command, "id": request_id, **options}) + "\n").encode())
         return conn
 
     def wait_for(self, path, seconds=3):
@@ -468,6 +468,32 @@ class ServerTests(ClientHarness):
                 self.assertLess(time.monotonic(), deadline, "stalled reader left command blocked")
                 time.sleep(0.05)
         self.assertIsNone(self.server.poll())
+
+    def test_protocol_error_is_not_a_command_exit_status(self):
+        with self.connect("ignored", "bad-request", cmd=12) as conn:
+            received = b""
+            while True:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                received += chunk
+        self.assertIn(b"bad request", received)
+        self.assertTrue(received.endswith(MARKER + b"255\n"))
+        self.assertEqual(self.client("exit 2").returncode, 2)
+
+    def test_service_start_failure_is_not_a_command_exit_status(self):
+        cwd_file = self.home / "not-a-directory"
+        cwd_file.write_text("a file")
+        with self.connect("exit 0", "bad-cwd", cwd=str(cwd_file)) as conn:
+            received = b""
+            while True:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                received += chunk
+        self.assertIn(b"could not start", received)
+        self.assertTrue(received.endswith(MARKER + b"255\n"))
+        self.assertEqual(self.client("exit 127").returncode, 127)
 
     def test_output_drains_before_status(self):
         result = self.client("head -c 200000 /dev/zero | tr '\\000' x")

@@ -185,12 +185,59 @@ class InstallTests(unittest.TestCase):
     def test_idle_scan_accepts_any_listener_fd_and_refuses_connections(self):
         with mock.patch.object(idle_update, "service_pid", return_value=123), \
              mock.patch("subprocess.check_output", return_value="123 1\n"), \
-             mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "p123\nf7\n")):
+             mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "p123\nf7\ntunix\n")):
             self.assertTrue(idle_update.service_is_idle("label", 123))
         with mock.patch.object(idle_update, "service_pid", return_value=123), \
              mock.patch("subprocess.check_output", return_value="123 1\n"), \
-             mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "p123\nf7\nf9\n")):
+             mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "p123\nf7\ntunix\nf9\ntunix\n")):
             self.assertFalse(idle_update.service_is_idle("label", 123))
+
+    def test_idle_scan_refuses_reparented_background_output_pipe(self):
+        with mock.patch.object(idle_update, "service_pid", return_value=123), \
+             mock.patch("subprocess.check_output", return_value="123 1\n"), \
+             mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "p123\nf7\ntunix\nf9\ntPIPE\n")):
+            self.assertFalse(idle_update.service_is_idle("label", 123))
+
+    def test_loaded_job_without_pid_can_be_repaired(self):
+        result = subprocess.CompletedProcess([], 0, "state = waiting\n", "")
+        with mock.patch("subprocess.run", return_value=result):
+            self.assertIsNone(idle_update.service_pid("label"))
+
+    def test_live_uninspectable_socket_refuses_replacement(self):
+        path = self.support / "runner.sock"
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(path))
+            listener.listen(1)
+            listener.settimeout(2)
+            def serve():
+                with listener.accept()[0] as conn:
+                    conn.recv(1024)
+                    conn.sendall(b"permissions\n\0DESK_RC=0\n")
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            with mock.patch.object(idle_update, "service_pid", return_value=None), \
+                 mock.patch("subprocess.run") as run:
+                with self.assertRaises(BusyError):
+                    idle_update.install_prepared(self.root, self.stage, self.home)
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(self.app_binary.read_bytes(), b"old app")
+        self.assertFalse(any("bootout" in call.args[0] for call in run.call_args_list))
+
+    def test_stale_socket_does_not_prevent_recovery(self):
+        path = self.support / "runner.sock"
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(path))
+        listener.close()
+        self.assertTrue(idle_update.socket_is_stale(path))
+        def run(command, **kwargs):
+            if command[:2] == ["launchctl", "bootstrap"]:
+                path.touch()
+            return subprocess.CompletedProcess(command, 0)
+        with mock.patch.object(idle_update, "service_pid", return_value=None), \
+             mock.patch("subprocess.run", side_effect=run), mock.patch("builtins.print"):
+            idle_update.install_prepared(self.root, self.stage, self.home)
+        self.assertEqual(self.app_binary.read_bytes(), b"new app")
 
     def test_idle_scan_refuses_child_commands_and_changed_pid(self):
         with mock.patch.object(idle_update, "service_pid", return_value=123), \

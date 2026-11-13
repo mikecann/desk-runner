@@ -60,9 +60,7 @@ def service_pid(label):
             return None
         raise BusyError(f"Cannot inspect Desk Runner: {result.stderr.strip()}")
     match = re.search(r"\bpid = (\d+)", result.stdout)
-    if not match:
-        raise BusyError("Desk Runner is loaded but not yet running; wait for it to settle")
-    return int(match[1])
+    return int(match[1]) if match else None
 
 
 def service_is_idle(label, pid):
@@ -72,10 +70,39 @@ def service_is_idle(label, pid):
     table = subprocess.check_output(["ps", "-axo", "pid=,ppid="], text=True)
     if any(int(line.split()[1]) == pid for line in table.splitlines()):
         return False
-    result = subprocess.run(["lsof", "-n", "-a", "-p", str(pid), "-U", "-F", "f"],
+    result = subprocess.run(["lsof", "-n", "-a", "-p", str(pid), "-F", "ft"],
                             capture_output=True, text=True)
-    # Only the listener remains. Don't assume it has a particular FD number.
-    return result.returncode == 0 and sum(line.startswith("f") for line in result.stdout.splitlines()) == 1
+    # A reparented background writer is no longer a child, but still depends
+    # on the service's PIPE read end. Restarting would kill it with SIGPIPE.
+    types = [line[1:] for line in result.stdout.splitlines() if line.startswith("t")]
+    return result.returncode == 0 and types.count("unix") == 1 and "PIPE" not in types
+
+
+def socket_is_stale(path):
+    import errno
+    import stat
+    if not stat.S_ISSOCK(path.stat().st_mode):
+        raise BusyError("Desk socket path contains a different kind of file")
+    with socket.socket(socket.AF_UNIX) as probe:
+        probe.settimeout(2)
+        try:
+            probe.connect(str(path))
+        except OSError as error:
+            if error.errno in (errno.ECONNREFUSED, errno.ENOENT):
+                return True
+            raise BusyError(f"Cannot determine whether Desk Runner is alive: {error}") from error
+        # A reachable socket is live even if launchctl didn't expose a PID.
+        # Finish a harmless request rather than abruptly dropping a legacy peer.
+        probe.sendall(b'{"cmd":"__permissions"}\n')
+        received = 0
+        while True:
+            chunk = probe.recv(1024)
+            if not chunk:
+                break
+            received += len(chunk)
+            if received > 4096:
+                raise BusyError("Unexpected response while checking Desk Runner")
+    return False
 
 
 def install_prepared(root, stage, home=None):
@@ -103,8 +130,11 @@ def install_prepared(root, stage, home=None):
         raise BusyError("Prepared deskctl is missing")
     subprocess.run(["codesign", "--verify", str(staged_app)], check=True)
     pid = service_pid(label)
+    stale_inode = None
     if pid is None and sock.exists():
-        raise BusyError("Desk socket exists without an inspectable service; refusing to replace it")
+        stale_inode = sock.stat().st_ino
+        if not socket_is_stale(sock):
+            raise BusyError("Desk socket is live without an inspectable service; refusing to replace it")
     guard = idle_socket(sock, lambda: service_is_idle(label, pid)) if pid else nullcontext()
 
     # Prepare a sibling directory for atomic renames, never overwrite a live
@@ -129,8 +159,16 @@ def install_prepared(root, stage, home=None):
             if pid:
                 subprocess.run(["launchctl", "bootout", label], check=True)
             else:
+                # Recovery from a stopped/crash-looping job is allowed only
+                # while it is still stopped and its old socket is still stale.
+                if service_pid(label) is not None:
+                    raise BusyError("Desk Runner started during preparation; retry when idle")
+                if sock.exists() and (sock.stat().st_ino != stale_inode or not socket_is_stale(sock)):
+                    raise BusyError("Desk Runner's socket changed during preparation")
                 subprocess.run(["launchctl", "bootout", label], capture_output=True)
             stopped = True
+            if pid is None:
+                sock.unlink(missing_ok=True)
             if app.exists():
                 app.rename(previous)
             ready.rename(app)

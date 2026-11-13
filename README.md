@@ -56,8 +56,9 @@ command already did (a click, a file) stays done, so check before retrying.
 `deskctl` lets go of held keys and a dragged mouse button when it's stopped.
 
 Background jobs that are still running when the command exits normally are
-left alone, and keep running even if Desk Runner restarts later; their output
-is discarded. If the command is killed by a signal, they're stopped too. A
+left alone while Desk Runner is running; their output is discarded. Updates
+wait for their output pipes to close too. Redirect a background job's output
+to a file if it must survive an unexpected service shutdown. If the command is killed by a signal, they're stopped too. A
 child that moves itself into a new process group (`set -m` job control, or a
 program that calls `setsid`) has detached itself on purpose and is left alone.
 
