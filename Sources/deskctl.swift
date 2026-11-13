@@ -78,6 +78,7 @@ func postKey(_ code: CGKeyCode, down: Bool, flags: CGEventFlags) {
 // Desk Runner stops a command whose client goes away, and a drag cut off
 // mid-way would otherwise leave the left button held.
 var modifiersDown: [CGKeyCode] = []
+var keyDown: CGKeyCode?
 var dragButtonDown = false
 let stateLock = NSLock()
 // The cleanup posts CoreGraphics events, which isn't safe inside a signal
@@ -89,6 +90,7 @@ let signalSources = [SIGINT, SIGTERM, SIGHUP].map { sig -> DispatchSourceSignal 
     let source = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
     source.setEventHandler {
         stateLock.lock()
+        if let keyDown { postKey(keyDown, down: false, flags: []) }
         for code in modifiersDown.reversed() { postKey(code, down: false, flags: []) }
         if dragButtonDown { post(.leftMouseUp, pointer()) }
         exit(128 + sig)
@@ -121,11 +123,21 @@ func key(_ combo: String, hold: Double = 0) {
         stateLock.unlock()
         usleep(10_000)
     }
-    if let code { postKey(code, down: true, flags: flags) }
+    if let code {
+        stateLock.lock()
+        keyDown = code
+        postKey(code, down: true, flags: flags)
+        stateLock.unlock()
+    }
     // Not usleep: a long hold overflows its 32-bit microseconds and traps with
     // the modifiers still down.
     Thread.sleep(forTimeInterval: max(hold, 0.03))
-    if let code { postKey(code, down: false, flags: flags) }
+    if let code {
+        stateLock.lock()
+        postKey(code, down: false, flags: flags)
+        keyDown = nil
+        stateLock.unlock()
+    }
     for modifier in held.reversed() {
         usleep(10_000)
         flags.remove(modifier.flag)

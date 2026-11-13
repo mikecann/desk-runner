@@ -319,6 +319,19 @@ class ServerTests(ClientHarness):
             os.kill(int(guard.group(1)), signal.SIGKILL)
             self.assert_never(done, 1.5)
 
+    def test_guard_killed_during_its_grace_period_still_kills(self):
+        started = self.home / "grace-started"
+        done = self.home / "grace-done"
+        with self.connect(f"trap '' TERM; touch {started}; sleep 4; touch {done}", "grace") as conn:
+            self.wait_for(started)
+            self.logs.seek(0)
+            guard = re.search(rb"request=grace guard=(\d+) started", self.logs.read())
+            self.assertIsNotNone(guard, "no guard logged")
+        # The client has gone, so the guard is in its two-second grace period.
+        time.sleep(0.5)
+        os.kill(int(guard.group(1)), signal.SIGKILL)
+        self.assert_never(done, 4.5)
+
     def test_server_crash_right_after_start_stops_command(self):
         # The command starts inside the guard's group, so there is no window
         # between it starting and the guard knowing it. A race this short can't

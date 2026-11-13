@@ -202,7 +202,8 @@ kill -KILL 0
 final class Lifeline {
     private let lock = NSLock()
     private var fd: Int32
-    private var done = false
+    private enum State { case active, released, cut }
+    private var state = State.active
     let group: pid_t
     let id: String
 
@@ -225,42 +226,55 @@ final class Lifeline {
         group = guardPID
         note("request=%@ guard=%d started", id, guardPID)
         Thread.detachNewThread { [self] in
+            // See the guard exit without reaping it yet: while its zombie
+            // exists, its PID, and so the group's ID, can't be handed to any
+            // other process, so the kills below can't hit an unrelated group.
+            var info = siginfo_t()
+            while waitid(P_PID, id_t(guardPID), &info, WEXITED | WNOWAIT) < 0 && errno == EINTR {}
+            guardExited()
             var status: Int32 = 0
             while waitpid(guardPID, &status, 0) < 0 && errno == EINTR {}
-            guardExited()
         }
     }
 
-    // If something kills the guard while the request is still running, the
-    // command would be unprotected, so Desk Runner stops it itself.
+    // The guard can't do its job if something kills it, so Desk Runner backs it up.
     private func guardExited() {
         lock.lock()
-        let unexpected = !done
-        done = true
+        let state = self.state
+        if state == .active { self.state = .cut }
         if fd >= 0 { close(fd); fd = -1 }
         lock.unlock()
-        guard unexpected else { return }
-        note("request=%@ guard=%d died; stopping the command", id, group)
-        killpg(group, SIGTERM)
-        Thread.sleep(forTimeInterval: 2)
-        killpg(group, SIGKILL)
+        switch state {
+        case .released:
+            return
+        case .cut:
+            // Stopping was asked for. Whether the guard got to its final KILL
+            // or was killed during its grace period, finish the job.
+            killpg(group, SIGKILL)
+        case .active:
+            note("request=%@ guard=%d died; stopping the command", id, group)
+            killpg(group, SIGTERM)
+            Thread.sleep(forTimeInterval: 2)
+            killpg(group, SIGKILL)
+        }
     }
 
-    private func finish(saying line: String?) {
+    private func finish(_ next: State) {
         lock.lock()
         defer { lock.unlock() }
-        guard !done else { return }
-        done = true
-        if let line { _ = line.withCString { write(fd, $0, strlen($0)) } }
+        guard state == .active else { return }
+        state = next
+        guard fd >= 0 else { return }
+        if next == .released { _ = "release\n".withCString { write(fd, $0, strlen($0)) } }
         close(fd)
         fd = -1
     }
 
     /// The command exited normally: leave anything it started in the background alone.
-    func release() { finish(saying: "release\n") }
+    func release() { finish(.released) }
 
     /// Stop the command's whole process group.
-    func cut() { finish(saying: nil) }
+    func cut() { finish(.cut) }
 
     deinit { cut() }
 }
@@ -369,6 +383,9 @@ func handle(_ fd: Int32) {
     Thread.detachNewThread {
         var status: Int32 = 0
         while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+        // Killed by a signal: stop what it left behind straight away, not
+        // after the output still queued for a slow client has been sent.
+        if status & 0x7f != 0 { lifeline.cut() }
         lock.lock(); waitStatus = status; running = false; lock.unlock()
         exited.signal()
     }
