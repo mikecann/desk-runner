@@ -254,29 +254,29 @@ class StartupTests(unittest.TestCase):
                 self.connect()
         launch.assert_not_called()
 
-    def test_update_lock_prevents_recovery(self):
+    def test_update_lock_prevents_any_connect_or_recovery(self):
         client = mock.MagicMock()
-        client.connect.side_effect = FileNotFoundError(errno.ENOENT, "socket parked")
         with startup_lock(Path(self.globals["SOCKET"]).parent), \
-             mock.patch.object(self.globals["socket"], "socket", return_value=client), \
+             mock.patch.object(self.globals["socket"], "socket", return_value=client) as factory, \
              mock.patch.object(self.globals["os"].path, "isfile", return_value=True), \
              mock.patch.object(self.globals["subprocess"], "run") as launch:
             with self.assertRaises(OSError) as error:
                 self.connect()
         self.assertEqual(error.exception.errno, errno.EBUSY)
+        factory.assert_not_called()
         launch.assert_not_called()
         client.sendall.assert_not_called()
 
     def test_older_updater_marker_prevents_recovery(self):
         Path(self.globals["SOCKET"]).with_name("runner.update.sock").touch()
         client = mock.MagicMock()
-        client.connect.side_effect = FileNotFoundError(errno.ENOENT, "socket parked")
-        with mock.patch.object(self.globals["socket"], "socket", return_value=client), \
+        with mock.patch.object(self.globals["socket"], "socket", return_value=client) as factory, \
              mock.patch.object(self.globals["os"].path, "isfile", return_value=True), \
              mock.patch.object(self.globals["subprocess"], "run") as launch:
             with self.assertRaises(OSError) as error:
                 self.connect()
         self.assertEqual(error.exception.errno, errno.EBUSY)
+        factory.assert_not_called()
         launch.assert_not_called()
 
     def test_start_timeout_is_bounded_and_never_submits_a_command(self):
