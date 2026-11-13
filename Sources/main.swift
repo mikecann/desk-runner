@@ -144,9 +144,11 @@ func discardBackgroundOutput(_ reader: FileHandle) {
     }
 }
 
-// posix_spawn rather than Process, so each command gets its own process group
-// (one killpg stops it and its children) and inherits no other request's fds.
-func spawn(_ args: [String], stdin: Int32, stdout: Int32, cwd: String?, env: [String: String]) -> pid_t? {
+// posix_spawn rather than Process, to choose the process group (one killpg
+// stops a command and its children) and inherit no other request's fds.
+// group 0 starts a new group led by the new process.
+func spawn(_ args: [String], stdin: Int32, stdout: Int32, cwd: String?, env: [String: String],
+           group: pid_t = 0) -> pid_t? {
     var actions: posix_spawn_file_actions_t?
     var attr: posix_spawnattr_t?
     posix_spawn_file_actions_init(&actions)
@@ -164,7 +166,7 @@ func spawn(_ args: [String], stdin: Int32, stdout: Int32, cwd: String?, env: [St
     sigfillset(&all)
     posix_spawnattr_setsigmask(&attr, &none)
     posix_spawnattr_setsigdefault(&attr, &all)
-    posix_spawnattr_setpgroup(&attr, 0)
+    posix_spawnattr_setpgroup(&attr, group)
     posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT |
                                           POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
     let argv = args.map { strdup($0) } + [nil]
@@ -178,73 +180,97 @@ func spawn(_ args: [String], stdin: Int32, stdout: Int32, cwd: String?, env: [St
 
 // A request's command must not outlive its supervisor: if Desk Runner crashes,
 // is restarted or is booted out mid-request, nobody can report the command's
-// result, yet it could still move the real pointer minutes later. Each request
-// gets a guard in its own process group (so launchd's cleanup of ours doesn't
-// take it first). It reads the command's group ID, then waits: "release" means
-// the command finished and later background jobs may carry on; end of input
-// without it means Desk Runner went away or gave up on the request, so the
-// guard stops the whole group, politely first.
+// result, yet it could still move the real pointer minutes later.
+//
+// So each request gets a guard first, leading a new process group (so
+// launchd's cleanup of Desk Runner's group doesn't take it first), and the
+// command is started inside that group. The group exists before the command
+// does, so there's no moment where the command runs and the guard doesn't know
+// what to stop. The guard waits on a pipe only Desk Runner can write to:
+// "release" means the command exited normally, and anything it left running in
+// the background may carry on; end of input without it means Desk Runner went
+// away or gave up on the request, so the guard stops the whole group, politely
+// first. It ignores the polite signals itself, and goes with the final KILL.
 let guardScript = """
-IFS= read -r group || exit 0
+trap '' TERM INT HUP
 IFS= read -r release && exit 0
-kill -TERM -- "-$group" 2>/dev/null || exit 0
-i=0
-# About 2 s; each step spawns a sleep, so keep the steps few.
-while [ $i -lt 10 ]; do kill -0 -- "-$group" 2>/dev/null || exit 0; sleep 0.2; i=$((i+1)); done
-kill -KILL -- "-$group" 2>/dev/null
-exit 0
+kill -TERM 0
+sleep 2
+kill -KILL 0
 """
 
 final class Lifeline {
+    private let lock = NSLock()
     private var fd: Int32
+    private var done = false
+    let group: pid_t
+    let id: String
 
     init?(id: String) {
+        self.id = id
         var fds: [Int32] = [0, 0]
         guard pipe(&fds) == 0 else { return nil }
         // The write end must reach no other child, or its EOF would never come.
         _ = fcntl(fds[1], F_SETFD, FD_CLOEXEC)
         _ = fcntl(fds[0], F_SETFD, FD_CLOEXEC)
+        // A dead guard must not take Desk Runner down with SIGPIPE.
+        _ = fcntl(fds[1], F_SETNOSIGPIPE, 1)
         let null = open("/dev/null", O_WRONLY | O_CLOEXEC)
         let guardPID = spawn(["/bin/sh", "-c", guardScript], stdin: fds[0], stdout: null, cwd: nil,
                              env: ["PATH": "/usr/bin:/bin"])
         close(null)
         close(fds[0])
         guard let guardPID else { close(fds[1]); return nil }
-        // Reap the guard whenever it exits, so it doesn't linger as a zombie.
-        Thread.detachNewThread { var status: Int32 = 0; while waitpid(guardPID, &status, 0) < 0 && errno == EINTR {} }
         fd = fds[1]
+        group = guardPID
         note("request=%@ guard=%d started", id, guardPID)
+        Thread.detachNewThread { [self] in
+            var status: Int32 = 0
+            while waitpid(guardPID, &status, 0) < 0 && errno == EINTR {}
+            guardExited()
+        }
     }
 
-    private func say(_ line: String) {
-        guard fd >= 0 else { return }
-        _ = line.withCString { write(fd, $0, strlen($0)) }
+    // If something kills the guard while the request is still running, the
+    // command would be unprotected, so Desk Runner stops it itself.
+    private func guardExited() {
+        lock.lock()
+        let unexpected = !done
+        done = true
+        if fd >= 0 { close(fd); fd = -1 }
+        lock.unlock()
+        guard unexpected else { return }
+        note("request=%@ guard=%d died; stopping the command", id, group)
+        killpg(group, SIGTERM)
+        Thread.sleep(forTimeInterval: 2)
+        killpg(group, SIGKILL)
     }
 
-    func watch(group: pid_t) { say("\(group)\n") }
-
-    /// The command finished: leave anything it started in the background alone.
-    func release() { say("release\n"); cut() }
-
-    /// Stop the command's whole process group.
-    func cut() {
-        guard fd >= 0 else { return }
+    private func finish(saying line: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !done else { return }
+        done = true
+        if let line { _ = line.withCString { write(fd, $0, strlen($0)) } }
         close(fd)
         fd = -1
     }
 
+    /// The command exited normally: leave anything it started in the background alone.
+    func release() { finish(saying: "release\n") }
+
+    /// Stop the command's whole process group.
+    func cut() { finish(saying: nil) }
+
     deinit { cut() }
 }
 
+// A client that has gone away shows as POLLHUP. Not readable EOF: a client
+// that only shut down its sending side can still read the result.
 func clientHungUp(_ fd: Int32) -> Bool {
-    var event = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+    var event = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
     guard poll(&event, 1, 0) > 0 else { return false }
-    if event.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 { return true }
-    // The client sends nothing after its request, so readable means closed,
-    // unless it sent stray bytes, which are discarded.
-    var byte: UInt8 = 0
-    let count = recv(fd, &byte, 1, MSG_DONTWAIT)
-    return count == 0 || (count < 0 && errno != EAGAIN && errno != EINTR)
+    return event.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0
 }
 
 func readRequest(_ fd: Int32) -> [String: Any]? {
@@ -322,7 +348,8 @@ func handle(_ fd: Int32) {
         return
     }
     let null = open("/dev/null", O_RDONLY | O_CLOEXEC)
-    let spawned = spawn(["/bin/bash", "-c", command], stdin: null, stdout: fds[1], cwd: cwd, env: env)
+    let spawned = spawn(["/bin/bash", "-c", command], stdin: null, stdout: fds[1], cwd: cwd, env: env,
+                        group: lifeline.group)
     let spawnError = errno
     close(null)
     close(fds[1])
@@ -333,9 +360,7 @@ func handle(_ fd: Int32) {
         connection.send(Data("could not start: \(String(cString: strerror(spawnError)))\n\(rcMarker)127\n".utf8))
         return
     }
-    // The command leads its own process group, so its ID is the group's.
-    lifeline.watch(group: pid)
-    note("request=%@ child=%d started", id, pid)
+    note("request=%@ child=%d started in group %d", id, pid, lifeline.group)
 
     var waitStatus: Int32 = 0
     let exited = DispatchSemaphore(value: 0)
@@ -369,9 +394,9 @@ func handle(_ fd: Int32) {
         } else if count == 0 {
             break
         } else if errno == EAGAIN || errno == EINTR {
-            var events = [pollfd(fd: pipeFD, events: Int16(POLLIN), revents: 0),
-                          pollfd(fd: fd, events: Int16(POLLIN), revents: 0)]
-            _ = poll(&events, cancelled ? 1 : 2, 100)
+            // The client is checked at the top of the loop, at least every 100 ms.
+            var event = pollfd(fd: pipeFD, events: Int16(POLLIN), revents: 0)
+            _ = poll(&event, 1, 100)
         } else {
             note("request=%@ output pipe read failed: errno=%d", id, errno)
             outputFailed = true
@@ -388,9 +413,10 @@ func handle(_ fd: Int32) {
             cancelled = true
         }
     }
-    // The command itself has finished. Anything it left in the background was
-    // started on purpose, so let it carry on.
-    if !cancelled { lifeline.release() }
+    // The command itself has finished. If it exited normally, anything it left
+    // in the background was started on purpose, so let it carry on. If it was
+    // killed by a signal, stop what it left behind.
+    if cancelled || waitStatus & 0x7f != 0 { lifeline.cut() } else { lifeline.release() }
     // The child has finished writing. Drain the bytes currently buffered, then
     // finish even if a background descendant still has the pipe open.
     var remaining: Int32 = 0

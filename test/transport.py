@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import re
 import runpy
 from pathlib import Path
 import socket
@@ -271,6 +272,49 @@ class ServerTests(ClientHarness):
         self.assertIn(b"result is unknown", error)
         self.assert_never(done, 0.9)
         self.assertFalse(child_done.exists())
+
+    def test_children_of_a_signalled_command_are_stopped(self):
+        child_done = self.home / "orphan-done"
+        result = self.client(f"(sleep 0.5; touch {child_done}) & kill -TERM $$")
+        self.assertEqual(result.returncode, 143)
+        self.assert_never(child_done, 0.9)
+
+    def test_half_closed_client_still_gets_its_result(self):
+        done = self.home / "half-closed-done"
+        with self.connect(f"sleep 0.4; touch {done}; exit 3", "half") as conn:
+            conn.shutdown(socket.SHUT_WR)
+            received = b""
+            while True:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                received += chunk
+        self.assertTrue(done.exists())
+        self.assertTrue(received.endswith(MARKER + b"3\n"), received)
+
+    def test_killed_guard_does_not_leave_command_unprotected(self):
+        started = self.home / "unguarded-started"
+        done = self.home / "unguarded-done"
+        with self.connect(f"touch {started}; sleep 1; touch {done}", "guard-killed"):
+            self.wait_for(started)
+            self.logs.seek(0)
+            guard = re.search(rb"request=guard-killed guard=(\d+) started", self.logs.read())
+            self.assertIsNotNone(guard, "no guard logged")
+            os.kill(int(guard.group(1)), signal.SIGKILL)
+            self.assert_never(done, 1.5)
+
+    def test_server_crash_right_after_start_stops_command(self):
+        # The command starts inside the guard's group, so there is no window
+        # between it starting and the guard knowing it. A race this short can't
+        # be forced from a test, so this only checks the earliest crash point.
+        done = self.home / "early-crash-done"
+        client = subprocess.Popen([sys.executable, str(ROOT / "desk"),
+                                   f"kill -KILL $PPID; sleep 0.6; touch {done}"],
+                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: client.poll() is None and client.kill())
+        client.communicate(timeout=5)
+        self.server.wait(timeout=5)
+        self.assert_never(done, 1)
 
     def test_background_job_survives_server_exit_after_parent_finished(self):
         finished = self.home / "detached-finished"

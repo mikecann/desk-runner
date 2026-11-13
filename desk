@@ -95,8 +95,9 @@ def main(request_id: str) -> int:
     sys.stdout.buffer.flush()
     report(
         f"Desk Runner: {failure} (request {request_id}, after {time.monotonic() - started:.1f}s). "
-        "The command's result is unknown. If the service went away, it stopped the command "
-        "too, but anything already done (clicks, files) stays done, so check before retrying. "
+        "The command's result is unknown. A current service stops the command when it goes "
+        "away (allow 2 s), but an older one may leave it running, and anything already done "
+        "(clicks, files) stays done, so check its process and output before retrying. "
         "Service logs: log show --last 10m --predicate 'subsystem == \"com.mikecann.desk-runner\"'."
     )
     return TRANSPORT_ERROR
@@ -107,13 +108,15 @@ if __name__ == "__main__":
     try:
         sys.exit(main(request_id))
     except KeyboardInterrupt:
-        report(f"Desk Runner: interrupted (request {request_id}). The service stops the command "
-               "when its client goes away; check what it already did before retrying.")
+        report(f"Desk Runner: interrupted (request {request_id}); result unknown. A current service "
+               "stops the command within 2 s, but an older one may leave it running. "
+               "Check its process and what it already did before retrying.")
         sys.exit(130)
     except BrokenPipeError:
         # Prevent a second exception when Python flushes stdout during shutdown.
         with open(os.devnull, "wb") as sink:
             os.dup2(sink.fileno(), sys.stdout.fileno())
-        report("Desk Runner: output consumer closed, so the command was stopped. "
-               "Check what it already did before retrying.")
+        report("Desk Runner: output consumer closed; result unknown. A current service stops the "
+               "command within 2 s, but an older one may leave it running. "
+               "Check its process and what it already did before retrying.")
         sys.exit(141)

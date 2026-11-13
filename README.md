@@ -49,13 +49,16 @@ clicking and typing after nobody can see its result. If `desk` goes away
 (Ctrl-C, a dropped SSH session, a closed output pipe) or Desk Runner itself
 stops, crashes or restarts mid-command, the command and everything it started
 are sent SIGTERM, then SIGKILL two seconds later. A small guard process per
-command does this, so it works even when Desk Runner is gone. Anything the
+command does this, so it works even when Desk Runner is gone, and Desk Runner
+stops the command itself if the guard is killed. Anything the
 command already did (a click, a file) stays done, so check before retrying.
 `deskctl` lets go of held keys and a dragged mouse button when it's stopped.
 
 Background jobs that are still running when the command exits normally are
 left alone, and keep running even if Desk Runner restarts later; their output
-is discarded.
+is discarded. If the command is killed by a signal, they're stopped too. A
+child that moves itself into a new process group (`set -m` job control, or a
+program that calls `setsid`) has detached itself on purpose and is left alone.
 
 If a reader that's still connected stops accepting output for 30 seconds, the
 service keeps the command running and discards further output. If the reader

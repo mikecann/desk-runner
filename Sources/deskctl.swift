@@ -74,17 +74,27 @@ func postKey(_ code: CGKeyCode, down: Bool, flags: CGEventFlags) {
 }
 
 // Modifiers that are down right now, so a Ctrl-C or kill during `hold` can let
-// them go instead of leaving the desk with Shift stuck down.
+// them go instead of leaving the desk with Shift stuck down. Same for a drag:
+// Desk Runner stops a command whose client goes away, and a drag cut off
+// mid-way would otherwise leave the left button held.
 var modifiersDown: [CGKeyCode] = []
-// Same for a drag: Desk Runner stops a command whose client goes away, and a
-// drag cut off mid-way would otherwise leave the left button held.
 var dragButtonDown = false
-for sig in [SIGINT, SIGTERM, SIGHUP] {
-    signal(sig) { sig in
+let stateLock = NSLock()
+// The cleanup posts CoreGraphics events, which isn't safe inside a signal
+// handler (the main thread may be inside CoreGraphics holding its locks). So
+// the signals are caught by dispatch sources on another thread instead.
+let signalQueue = DispatchQueue(label: "deskctl.signals")
+let signalSources = [SIGINT, SIGTERM, SIGHUP].map { sig -> DispatchSourceSignal in
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
+    source.setEventHandler {
+        stateLock.lock()
         for code in modifiersDown.reversed() { postKey(code, down: false, flags: []) }
         if dragButtonDown { post(.leftMouseUp, pointer()) }
         exit(128 + sig)
     }
+    source.resume()
+    return source
 }
 
 // Press the modifiers down one at a time, then the key, then let go in reverse,
@@ -105,8 +115,10 @@ func key(_ combo: String, hold: Double = 0) {
     var flags: CGEventFlags = []
     for modifier in held {
         flags.insert(modifier.flag)
+        stateLock.lock()
         modifiersDown.append(modifier.code)
         postKey(modifier.code, down: true, flags: flags)
+        stateLock.unlock()
         usleep(10_000)
     }
     if let code { postKey(code, down: true, flags: flags) }
@@ -117,8 +129,10 @@ func key(_ combo: String, hold: Double = 0) {
     for modifier in held.reversed() {
         usleep(10_000)
         flags.remove(modifier.flag)
+        stateLock.lock()
         postKey(modifier.code, down: false, flags: flags)
         modifiersDown.removeLast()
+        stateLock.unlock()
     }
     usleep(30_000)
 }
@@ -187,13 +201,17 @@ case "click", "rightclick":
     }
 case "drag":
     glide(to: CGPoint(x: n[0], y: n[1]), seconds: 0.5)
+    stateLock.lock()
     dragButtonDown = true
     post(.leftMouseDown, CGPoint(x: n[0], y: n[1]))
+    stateLock.unlock()
     usleep(120_000)
     glide(to: CGPoint(x: n[2], y: n[3]), seconds: n.count > 4 ? n[4] : 0.8, dragging: true)
     usleep(120_000)
+    stateLock.lock()
     post(.leftMouseUp, CGPoint(x: n[2], y: n[3]))
     dragButtonDown = false
+    stateLock.unlock()
 case "type":
     type(args[0], perKey: args.count > 1 ? Double(args[1]) ?? 0.04 : 0.04)
 case "key":
