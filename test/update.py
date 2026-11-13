@@ -202,6 +202,7 @@ class InstallTests(unittest.TestCase):
                     raise subprocess.CalledProcessError(1, command)
             return subprocess.CompletedProcess(command, 0)
         with mock.patch.object(idle_update, "service_pid", return_value=123), \
+             mock.patch.object(idle_update, "service_is_idle", return_value=True), \
              mock.patch.object(idle_update, "idle_socket", return_value=nullcontext()), \
              mock.patch("subprocess.run", side_effect=run) as calls:
             with self.assertRaises(subprocess.CalledProcessError):
