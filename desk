@@ -98,7 +98,7 @@ def main(request_id: str) -> int:
         "The command's result is unknown. A current service stops the command when it goes "
         "away (allow 2 s), but an older one may leave it running, and anything already done "
         "(clicks, files) stays done, so check its process and output before retrying. "
-        "Service logs: log show --last 10m --predicate 'subsystem == \"com.mikecann.desk-runner\"'."
+        "Service logs: /usr/bin/log show --last 10m --predicate 'subsystem == \"com.mikecann.desk-runner\"'."
     )
     return TRANSPORT_ERROR
 

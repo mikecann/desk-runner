@@ -71,7 +71,7 @@ The service logs request IDs, child process IDs and completion statuses without
 logging command text. To inspect them on the machine running Desk Runner:
 
 ```bash
-log show --last 10m --style compact --predicate 'subsystem == "com.mikecann.desk-runner"'
+/usr/bin/log show --last 10m --style compact --predicate 'subsystem == "com.mikecann.desk-runner"'
 ```
 
 Key presses clear the event's process ID so apps treat them like real typing.
