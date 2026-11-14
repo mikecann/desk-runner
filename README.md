@@ -44,6 +44,13 @@ and waits up to 15 seconds for it to become ready. It uses `kickstart` without
 a lock, so recovery won't launch anything during an update. Recovery happens before sending any command; a lost
 connection after submission is reported without replaying the command.
 
+Never start the app with `open` (or Finder). That launches a second copy
+outside the login agent, and when the agent starts later it takes the
+socket's name, leaving the first copy running and unreachable. It happened
+on 14 Nov after a reboot: two copies for hours, which made a stuck job look
+like a Desk Runner fault. If `desk` can't connect, run it again (it starts
+the agent itself) or `launchctl kickstart gui/$(id -u)/com.mikecann.desk-runner`.
+
 From another machine: `ssh host '~/.local/bin/desk "deskctl windows"'`.
 
 `desk` returns the command's exit status, or `128 + signal` if it was killed
